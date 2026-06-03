@@ -1,11 +1,17 @@
 """
-OptikLink 每日自动登录脚本 v4.5 (CloakBrowser版)
+OptikLink 每日自动登录脚本 v4.6 (CloakBrowser版)
 原理：用 CloakBrowser 打开页面，注入 Discord Token 完成 OAuth2 授权
+
+修复记录 v4.6:
+  - 【录屏修复】抛弃 threading + page.screenshot() 方案（greenlet 跨线程错误）
+    改为 subprocess 调 import/scrot 截取 Xvfb 屏幕，完全绕开 Playwright 线程限制
+  - 【弹窗修复】新增 Google Vignette 弹窗广告自动关闭逻辑
+    点击 Discord 按钮后检测 #google_vignette 并逐层关闭所有遮罩层
+  - 新增通用弹窗/广告拦截器，在页面加载后自动清除常见广告弹窗
 
 修复记录 v4.5:
   - 新增录屏功能：环境变量 ENABLE_SCREENRECORD=true 开启，默认 false
-  - 录屏文件保存至 recordings/ 目录，格式为 webm
-  - 录屏在 browser.new_page() 后立即开始，在 finally 块中停止并保存
+  - 录屏文件保存至 recordings/ 目录
   - 与截图功能互相独立，可单独或同时开启
 
 修复记录 v4.4:
@@ -14,13 +20,6 @@ OptikLink 每日自动登录脚本 v4.5 (CloakBrowser版)
 
 修复记录 v4.3:
   - 在点击 Discord 按钮前，自动关闭 Cookie/GDPR 同意弹窗（fc- 前缀）
-
-修复记录 v4.2:
-  - 修复 Discord 登录按钮选择器顺序（button 优先于 a 标签）
-  - 增加按钮等待超时时间（3000ms）
-  - 页面加载后增加 2s 等待让 JS 渲染完成
-  - 找不到按钮时自动打印页面所有可交互元素（调试用）
-  - 新增 button[class*="discord"] / [class*="discord"] 选择器兜底
 """
 
 import os
@@ -28,6 +27,7 @@ import re
 import sys
 import json
 import time
+import subprocess
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,32 +74,56 @@ def take_screenshot(page, name: str):
         log.warning(f"截图失败: {e}")
 
 # ─────────────────────────────────────────────────────────────
-# 录屏
+# 录屏 v4.6 — 改用 subprocess + import/scrot 截 Xvfb 屏幕
+# 原因：Playwright sync_api 绑定 greenlet，不能从 threading.Thread 调用
 # ─────────────────────────────────────────────────────────────
 RECORDING_DIR = Path("./recordings")
 RECORDING_DIR.mkdir(exist_ok=True)
 
-def start_recording(context):
+# 运行时探测可用的截屏命令（按优先级）
+def _detect_screen_capture_cmd():
+    """探测可用的 X11 截屏工具，返回 (cmd_args_template, 说明) """
+    candidates = [
+        # import: ImageMagick 的 X11 截屏工具，最可靠
+        (["import", "-window", "root", "-display", ":99"], "import"),
+        # scrot: 轻量级截屏工具
+        (["scrot", "--display", ":99", "--silent"], "scrot"),
+        # xwd: X11 原生 dump，兼容性最好但输出是 XWD 格式
+        (["xwd", "-root", "-display", ":99"], "xwd"),
+    ]
+    for args, name in candidates:
+        try:
+            result = subprocess.run(
+                ["which", args[0]], capture_output=True, text=True, timeout=3
+            )
+            if result.returncode == 0:
+                log.info(f"🎬 录屏工具: {name} ({result.stdout.strip()})")
+                return args, name
+        except Exception:
+            continue
+    log.warning("⚠️ 未找到任何 X11 截屏工具（import/scrot/xwd），录屏将不可用")
+    return None, None
+
+_SCREEN_CAPTURE_ARGS, _SCREEN_CAPTURE_NAME = (None, None)  # 延迟初始化
+
+
+def start_page_recording(page=None):
     """
-    开始录屏。需要传入 browser context（不是 page）。
-    Playwright 的 record_video 必须在 new_context() 时指定，
-    但 CloakBrowser 通常直接暴露 browser.new_page()，
-    所以这里改用 context.tracing 或手动逐帧截图方案作为兼容兜底。
-    返回一个 recorder 对象（dict），供 stop_recording 使用。
+    开始录屏 — 用 subprocess 调 import/scrot/xwd 定时截取 Xvfb 虚拟屏幕 :99。
+    后台线程不接触任何 Playwright 对象，彻底绕开 greenlet 限制。
+    page 参数保留以兼容旧调用，实际不使用。
     """
+    global _SCREEN_CAPTURE_ARGS, _SCREEN_CAPTURE_NAME
+
     if not ENABLE_SCREENRECORD:
         return None
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    rec = {"ts": ts, "running": True, "frames": [], "thread": None}
-    return rec
 
-def start_page_recording(page):
-    """
-    基于定时截图实现录屏：每 500ms 截一帧，最终合成为 GIF / 视频。
-    在独立线程中运行，不阻塞主流程。
-    返回 recorder dict，供 stop_page_recording 使用。
-    """
-    if not ENABLE_SCREENRECORD:
+    # 延迟探测截屏工具
+    if _SCREEN_CAPTURE_ARGS is None:
+        _SCREEN_CAPTURE_ARGS, _SCREEN_CAPTURE_NAME = _detect_screen_capture_cmd()
+
+    if _SCREEN_CAPTURE_ARGS is None:
+        log.error("🎬 录屏已启用但无可用截屏工具，跳过录屏")
         return None
 
     import threading
@@ -110,105 +134,144 @@ def start_page_recording(page):
 
     rec = {
         "ts":        ts,
-        "frame_dir": frame_dir,
+        "frame_dir": str(frame_dir),
         "running":   True,
         "count":     0,
         "thread":    None,
+        "tool":      _SCREEN_CAPTURE_NAME,
     }
 
+    capture_args = _SCREEN_CAPTURE_ARGS  # 闭包捕获
+
     def _capture():
+        idx = 0
         while rec["running"]:
+            path = str(frame_dir / f"frame_{idx:05d}.png")
             try:
-                idx = rec["count"]
-                path = str(frame_dir / f"frame_{idx:05d}.png")
-                page.screenshot(path=path, full_page=False)
-                rec["count"] += 1
+                if capture_args[0] == "xwd":
+                    # xwd 输出 XWD 格式，需要管道给 convert 转 PNG
+                    result = subprocess.run(
+                        ["xwd", "-root", "-display", ":99"],
+                        capture_output=True,
+                        timeout=5,
+                    )
+                    if result.returncode == 0:
+                        subprocess.run(
+                            ["convert", "xwd:-", path],
+                            input=result.stdout,
+                            capture_output=True,
+                            timeout=5,
+                        )
+                else:
+                    subprocess.run(
+                        capture_args + [path],
+                        capture_output=True,
+                        timeout=5,
+                    )
             except Exception:
-                pass
+                pass  # 帧截图失败不中断录屏
+            idx += 1
             time.sleep(0.5)
+        rec["count"] = idx
 
     t = threading.Thread(target=_capture, daemon=True)
     t.start()
     rec["thread"] = t
-    log.info(f"🎬 录屏已开始，帧目录: {frame_dir}")
+    log.info(f"🎬 录屏已开始（{_SCREEN_CAPTURE_NAME} 截屏 :99），帧目录: {frame_dir}")
     return rec
+
 
 def stop_page_recording(rec):
     """
-    停止录屏，将帧合成为 GIF（无需额外依赖）或 MP4（需要 imageio / ffmpeg）。
-    优先尝试 Pillow 合成 GIF，失败则保留帧目录供手动查看。
+    停止录屏，用 ffmpeg 将 PNG 帧合成为 MP4。
+    保留帧目录供手动查看作为后备方案。
     """
     if rec is None:
         return
 
     rec["running"] = False
     if rec.get("thread"):
-        rec["thread"].join(timeout=2)
+        rec["thread"].join(timeout=3)
 
-    frame_dir = rec["frame_dir"]
+    frame_dir = Path(rec["frame_dir"])
     ts        = rec["ts"]
     count     = rec["count"]
     log.info(f"🎬 录屏停止，共采集 {count} 帧")
 
     if count == 0:
-        log.warning("录屏无帧，跳过合成")
+        log.warning("录屏无帧，跳过合成（截屏工具可能不可用或 DISPLAY 未设置）")
         return
 
-    # ── 方案 A：用 Pillow 合成 GIF ──────────────────────────
-    try:
-        from PIL import Image
-
-        frames_paths = sorted(frame_dir.glob("frame_*.png"))
-        images = [Image.open(str(p)).convert("P", dither=Image.FLOYDSTEINBERG) for p in frames_paths]
-        out_path = str(RECORDING_DIR / f"{ts}_recording.gif")
-        images[0].save(
-            out_path,
-            save_all=True,
-            append_images=images[1:],
-            duration=500,      # 每帧 500ms，与采集间隔一致
-            loop=0,
-            optimize=True,
-        )
-        log.info(f"🎬 GIF 已保存: {out_path}")
-
-        # 合成成功后清理帧目录节省空间
-        for p in frames_paths:
-            p.unlink()
-        frame_dir.rmdir()
+    frames_paths = sorted(frame_dir.glob("frame_*.png"))
+    if len(frames_paths) == 0:
+        log.warning("帧目录为空，跳过合成")
         return
-    except ImportError:
-        log.warning("Pillow 未安装，尝试 ffmpeg 合成 MP4...")
-    except Exception as e:
-        log.warning(f"GIF 合成失败: {e}，尝试 ffmpeg...")
 
-    # ── 方案 B：用 ffmpeg 合成 MP4 ──────────────────────────
+    # ── 方案 A：用 ffmpeg 合成 MP4 ──────────────────────────
+    out_path = str(RECORDING_DIR / f"{ts}_recording.mp4")
     try:
-        import subprocess
-        out_path = str(RECORDING_DIR / f"{ts}_recording.mp4")
         cmd = [
             "ffmpeg", "-y",
-            "-framerate", "2",                          # 2fps（每帧 500ms）
+            "-framerate", "2",                           # 2fps（与 500ms 间隔一致）
             "-i", str(frame_dir / "frame_%05d.png"),
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # 保证偶数尺寸
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", # 保证偶数尺寸
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
+            "-preset", "ultrafast",
             out_path,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode == 0:
             log.info(f"🎬 MP4 已保存: {out_path}")
-            for p in sorted(frame_dir.glob("frame_*.png")):
-                p.unlink()
-            frame_dir.rmdir()
+            # 合成成功后清理帧目录节省空间
+            for p in frames_paths:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            try:
+                frame_dir.rmdir()
+            except Exception:
+                pass
+            return
         else:
-            log.warning(f"ffmpeg 失败: {result.stderr[:200]}")
-            log.info(f"🎬 帧目录保留供手动查看: {frame_dir}（共 {count} 帧）")
+            log.warning(f"ffmpeg 失败: {result.stderr[:300]}")
     except FileNotFoundError:
-        log.warning("ffmpeg 未找到，帧目录保留供手动查看")
-        log.info(f"🎬 帧目录: {frame_dir}（共 {count} 帧）")
+        log.warning("ffmpeg 未找到")
+    except subprocess.TimeoutExpired:
+        log.warning("ffmpeg 合成超时")
     except Exception as e:
-        log.warning(f"MP4 合成异常: {e}")
-        log.info(f"🎬 帧目录保留供手动查看: {frame_dir}")
+        log.warning(f"ffmpeg 合成异常: {e}")
+
+    # ── 方案 B：用 Pillow 合成 GIF ──────────────────────────
+    try:
+        from PIL import Image
+        images = [Image.open(str(p)).convert("P", dither=Image.FLOYDSTEINBERG) for p in frames_paths]
+        out_gif = str(RECORDING_DIR / f"{ts}_recording.gif")
+        images[0].save(
+            out_gif,
+            save_all=True,
+            append_images=images[1:],
+            duration=500,
+            loop=0,
+            optimize=True,
+        )
+        log.info(f"🎬 已保存 GIF: {out_gif}")
+        for p in frames_paths:
+            try:
+                p.unlink()
+            except Exception:
+                pass
+        try:
+            frame_dir.rmdir()
+        except Exception:
+            pass
+    except ImportError:
+        log.warning("Pillow 未安装")
+        log.info(f"🎬 帧目录保留供手动查看: {frame_dir}（共 {count} 帧）")
+    except Exception as e:
+        log.warning(f"GIF 合成失败: {e}")
+        log.info(f"🎬 帧目录保留供手动查看: {frame_dir}（共 {count} 帧）")
 
 # ─────────────────────────────────────────────────────────────
 # WxPusher 推送
@@ -340,6 +403,138 @@ def handle_oauth_page(page):
         page.wait_for_timeout(1500)
 
 # ─────────────────────────────────────────────────────────────
+# v4.6 新增：关闭页面弹窗/广告
+# ─────────────────────────────────────────────────────────────
+def close_popups_and_overlays(page):
+    """
+    用 JS 关闭页面上所有可能的弹窗、广告遮罩层。
+    包括 Google Vignette、Cookie 弹窗、各类 modal overlay。
+    返回关闭的弹窗数量。
+    """
+    closed_count = page.evaluate("""() => {
+        let closed = 0;
+
+        // 1. Google Vignette 弹窗（#google_vignette 相关）
+        const vignetteSelectors = [
+            '#google-vignette', '.google-vignette', '[id*="vignette"]',
+            '#credential_picker_container', '#credential-picker-container',
+            'div[aria-modal="true"]', '[role="dialog"]',
+        ];
+        for (const sel of vignetteSelectors) {
+            for (const el of document.querySelectorAll(sel)) {
+                el.remove();
+                closed++;
+            }
+        }
+
+        // 2. 常见高 z-index 遮罩 (遮罩层通常 z-index > 1000)
+        const allDivs = document.querySelectorAll('div');
+        for (const el of allDivs) {
+            const style = getComputedStyle(el);
+            const z = parseInt(style.zIndex) || 0;
+            if (z > 1000 && (
+                style.position === 'fixed' || style.position === 'absolute'
+            )) {
+                const rect = el.getBoundingClientRect();
+                // 覆盖大面积 (>50% 视口) 的遮罩
+                if (rect.width > window.innerWidth * 0.5 &&
+                    rect.height > window.innerHeight * 0.5) {
+                    el.remove();
+                    closed++;
+                }
+            }
+        }
+
+        // 3. 通用 iframe 广告
+        for (const iframe of document.querySelectorAll('iframe')) {
+            const src = (iframe.src || '').toLowerCase();
+            if (src.includes('google') || src.includes('doubleclick') ||
+                src.includes('ad') || src.includes('adsense') ||
+                src.includes('vignette')) {
+                iframe.remove();
+                closed++;
+            }
+        }
+
+        // 4. 恢复 body 滚动 (弹窗通常设置 overflow:hidden)
+        document.body.style.overflow = '';
+        document.documentElement.style.overflow = '';
+
+        return closed;
+    }""")
+    if closed_count > 0:
+        log.info(f"🧹 已关闭 {closed_count} 个弹窗/广告/遮罩")
+    return closed_count
+
+
+def handle_google_vignette(page):
+    """
+    专门处理 Google Vignette 弹窗 — 
+    表现为 URL hash 出现 #google_vignette 且页面被遮罩挡住。
+    """
+    current_url = page.url
+    if "google_vignette" not in current_url:
+        return False
+
+    log.info("⚠️ 检测到 Google Vignette 弹窗，正在关闭...")
+
+    # 方法一：JS 暴力清除所有遮罩层
+    page.evaluate("""() => {
+        document.querySelectorAll('*').forEach(el => {
+            const s = getComputedStyle(el);
+            const z = parseInt(s.zIndex) || 0;
+            if (z > 100 && (s.position === 'fixed' || s.position === 'absolute')) {
+                const r = el.getBoundingClientRect();
+                if (r.width >= window.innerWidth * 0.3 || r.height >= window.innerHeight * 0.3) {
+                    el.remove();
+                }
+            }
+        });
+        document.body.style.overflow = '';
+        document.body.style.position = '';
+        document.documentElement.style.overflow = '';
+        if (window.location.hash.includes('google_vignette')) {
+            history.replaceState(null, '', window.location.pathname + window.location.search);
+        }
+    }""")
+    page.wait_for_timeout(1000)
+
+    # 方法二：用 Playwright 点击可能的关闭按钮
+    for close_sel in [
+        'button[aria-label="Close"]',
+        'button[aria-label="关闭"]',
+        '[class*="close"]',
+        '[class*="dismiss"]',
+        'button:has-text("Close")',
+        'button:has-text("关闭")',
+        'a[aria-label="Close"]',
+    ]:
+        try:
+            el = page.locator(close_sel).first
+            if el.is_visible(timeout=1000):
+                el.click()
+                log.info(f"已点击关闭按钮: {close_sel}")
+                page.wait_for_timeout(1000)
+                break
+        except Exception:
+            continue
+
+    # 方法三：按 Escape
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    current_url_after = page.url
+    if "google_vignette" not in current_url_after:
+        log.info("✅ Google Vignette 已关闭")
+        return True
+
+    log.warning("⚠️ Google Vignette 仍存在，尝试重新点击 Discord 按钮")
+    return False
+
+# ─────────────────────────────────────────────────────────────
 # 主登录流程
 # ─────────────────────────────────────────────────────────────
 def do_login(page) -> bool:
@@ -351,6 +546,9 @@ def do_login(page) -> bool:
     take_screenshot(page, "01_auth_page")
 
     page.wait_for_timeout(2000)
+
+    # v4.6: 页面加载后先清理一次弹窗
+    close_popups_and_overlays(page)
 
     # 服务条款确认按钮
     try:
@@ -382,7 +580,10 @@ def do_login(page) -> bool:
         except Exception:
             continue
 
-    # FIX v4.4: Discord 按钮实际是 <a href="login"> 无文字图标链接，置于首位
+    # v4.6: 再清理一轮弹窗
+    close_popups_and_overlays(page)
+
+    # 点击 Discord 登录按钮
     log.info("[B] 点击 Discord 登录按钮...")
     clicked = False
     for sel in [
@@ -430,6 +631,41 @@ def do_login(page) -> bool:
             log.warning(f"调试元素打印失败: {e}")
         take_screenshot(page, "01b_click_fail")
         return False
+
+    # ──────── v4.6: Google Vignette 弹窗检测与关闭 ────────
+    page.wait_for_timeout(2000)
+
+    if "google_vignette" in page.url:
+        log.info("检测到 Google Vignette 弹窗，正在处理...")
+        take_screenshot(page, "01c_google_vignette")
+        handle_google_vignette(page)
+        page.wait_for_timeout(1500)
+        close_popups_and_overlays(page)
+
+        if "discord.com" not in page.url and "google_vignette" not in page.url:
+            log.info("弹窗已关闭，重新点击 Discord 按钮...")
+            for sel in ['a[href="login"]', 'a[href="login"].hyperlink_abs']:
+                try:
+                    btn = page.locator(sel).first
+                    if btn.is_visible(timeout=3000):
+                        btn.click()
+                        log.info(f"重新点击: {sel}")
+                        page.wait_for_timeout(2000)
+                        break
+                except Exception:
+                    continue
+
+    for _ in range(3):
+        if "google_vignette" in page.url:
+            log.info("Google Vignette 仍存在，尝试 Escape...")
+            try:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(1000)
+            except Exception:
+                pass
+            close_popups_and_overlays(page)
+        else:
+            break
 
     # 等待跳转到 discord.com
     log.info("[C] 等待跳转到 Discord...")
@@ -607,7 +843,7 @@ def build_message(info: dict) -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 55)
-    log.info("  OptikLink 自动登录脚本 v4.5 (CloakBrowser)")
+    log.info("  OptikLink 自动登录脚本 v4.6 (CloakBrowser)")
     log.info("=" * 55)
     log.info(f"  截图: {'开启' if ENABLE_SCREENSHOT else '关闭'}  |  录屏: {'开启' if ENABLE_SCREENRECORD else '关闭'}")
 
@@ -627,7 +863,7 @@ def main():
     except Exception:
         pass
 
-    # 录屏：在页面创建后立即开始
+    # 录屏：页面创建后开始（v4.6 改用 scrot/import 截 Xvfb 屏幕）
     recorder = start_page_recording(page)
 
     try:
