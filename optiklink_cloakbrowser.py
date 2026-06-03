@@ -1,10 +1,13 @@
 """
-OptikLink 每日自动登录脚本 v4.3 (CloakBrowser版)
+OptikLink 每日自动登录脚本 v4.4 (CloakBrowser版)
 原理：用 CloakBrowser 打开页面，注入 Discord Token 完成 OAuth2 授权
+
+修复记录 v4.4:
+  - Discord 按钮实际为 <a href="login" class="hyperlink_abs w-inline-block">（无文字，图标为图片）
+  - 将 a[href="login"].hyperlink_abs / a[href="login"] 加入选择器列表并置于首位
 
 修复记录 v4.3:
   - 在点击 Discord 按钮前，自动关闭 Cookie/GDPR 同意弹窗（fc- 前缀）
-  - 弹窗会遮挡 Discord 按钮导致 is_visible() 返回 False，修复后先 Consent 再找按钮
 
 修复记录 v4.2:
   - 修复 Discord 登录按钮选择器顺序（button 优先于 a 标签）
@@ -240,10 +243,14 @@ def do_login(page) -> bool:
         except Exception:
             continue
 
-    # FIX v4.2: 调整选择器顺序，button 优先于 a 标签，增加 class 兜底选择器
+    # FIX v4.4: Discord 按钮实际是 <a href="login" class="hyperlink_abs w-inline-block">（无文字，图标为图片）
+    # 放在首位；其余选择器保留作兜底
     log.info("[B] 点击 Discord 登录按钮...")
     clicked = False
     for sel in [
+        'a[href="login"].hyperlink_abs',         # FIX v4.4: 精确匹配
+        'a[href="login"]',                        # FIX v4.4: 宽松匹配
+        'div.nav_login_block_extra a[href="login"]',  # FIX v4.4: 带父级限定
         'button:has-text("DISCORD")',
         'button:has-text("Discord")',
         'button:has-text("discord")',
@@ -463,7 +470,7 @@ def build_message(info: dict) -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 55)
-    log.info("  OptikLink 自动登录脚本 v4.3 (CloakBrowser)")
+    log.info("  OptikLink 自动登录脚本 v4.4 (CloakBrowser)")
     log.info("=" * 55)
 
     from cloakbrowser import launch, ensure_binary
