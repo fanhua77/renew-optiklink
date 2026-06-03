@@ -1,407 +1,358 @@
 """
-OptikLink 每日自动登录脚本 v3
-原理：用 Discord Token 完成 OAuth2 授权，拿到 session 后访问 Dashboard
-
-敏感信息处理规范：
-  - Token / UID 等凭证全部从环境变量读取，从不硬编码
-  - 日志输出中所有敏感值均经过 mask() 脱敏
+OptikLink 每日自动登录脚本 v4 (CloakBrowser版)
+原理：用 CloakBrowser 打开页面，注入 Discord Token 完成 OAuth2 授权
+参考：natfreecloud_renew_CloakBrowser / FreezeHost
 """
 
 import os
 import re
 import sys
+import json
+import time
+import logging
 from datetime import datetime, timezone
-from urllib.parse import urlparse, parse_qs, urlencode
+from pathlib import Path
 
-# 优先使用 cloudscraper 绕过 Cloudflare 验证
-try:
-    import cloudscraper
-    USE_CLOUDSCRAPER = True
-    print("[信息] 使用 cloudscraper 绕过 Cloudflare 人机验证")
-except ImportError:
-    import requests
-    USE_CLOUDSCRAPER = False
-    print("[警告] cloudscraper 未安装，将使用普通 requests，可能无法绕过 Cloudflare 验证")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────
-# 配置区（全部从 GitHub Secrets / 环境变量读取，禁止明文硬编码）
+# 配置（全部从 GitHub Secrets / 环境变量读取）
 # ─────────────────────────────────────────────────────────────
-DISCORD_TOKEN  = os.environ["DISCORD_TOKEN"]    # Discord Token
-WXPUSHER_TOKEN = os.environ["WXPUSHER_TOKEN"]   # WxPusher appToken
-WXPUSHER_UID   = os.environ["WXPUSHER_UID"]     # WxPusher 接收者 UID
+DISCORD_TOKEN  = os.environ["DISCORD_TOKEN"]
+WXPUSHER_TOKEN = os.environ["WXPUSHER_TOKEN"]
+WXPUSHER_UID   = os.environ["WXPUSHER_UID"]
+EXPIRE_DATE    = os.environ.get("EXPIRE_DATE", "")
+PROXY_URL      = os.environ.get("PROXY_URL", "socks5://127.0.0.1:10808")
+ENABLE_SCREENSHOT = os.environ.get("ENABLE_SCREENSHOT", "false").lower() == "true"
 
-# 服务到期日：优先从环境变量 EXPIRE_DATE 读取（格式 DD.MM.YYYY），
-# 否则使用下方兜底值（每次续期后更新此处 OR 在 Secrets 中维护）
-EXPIRE_DATE = os.environ.get("EXPIRE_DATE", "22.05.2026")
-
-# ── OptikLink Discord OAuth2 参数 ─────────────────────────────
-# 优先从 Secrets 环境变量读取，便于 client_id 变更后无需改代码
-# 若下面的值失效：按文末说明重新抓取后更新 GitHub Secrets
-DISCORD_CLIENT_ID    = os.environ.get("DISCORD_CLIENT_ID",    "933437142254887052")
-DISCORD_REDIRECT_URI = os.environ.get("DISCORD_REDIRECT_URI", "https://optiklink.com/login")
+BASE_URL   = "https://optiklink.net"
+AUTH_URL   = f"{BASE_URL}/auth"
+HOME_URL   = f"{BASE_URL}/home"
 
 # ─────────────────────────────────────────────────────────────
-HEADERS_BROWSER = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-
+# 截图
 # ─────────────────────────────────────────────────────────────
-# 脱敏工具：保留前4位 + *** + 后4位，长度不足时全部遮盖
-# ─────────────────────────────────────────────────────────────
-def mask(value: str, keep: int = 4) -> str:
-    if not value:
-        return "***"
-    if len(value) <= keep * 2:
-        return "***"
-    return value[:keep] + "***" + value[-keep:]
+SCREENSHOT_DIR = Path("./screenshots")
+SCREENSHOT_DIR.mkdir(exist_ok=True)
 
+def take_screenshot(page, name: str):
+    if not ENABLE_SCREENSHOT:
+        return
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = str(SCREENSHOT_DIR / f"{ts}_{name}.png")
+        page.screenshot(path=path, full_page=True)
+        log.info(f"📸 截图已保存: {path}")
+    except Exception as e:
+        log.warning(f"截图失败: {e}")
 
 # ─────────────────────────────────────────────────────────────
 # WxPusher 推送
 # ─────────────────────────────────────────────────────────────
-def wxpusher_send(title: str, content: str):
-    import requests
-    resp = requests.post(
-        "https://wxpusher.zjiecode.com/api/send/message",
-        json={
-            "appToken": WXPUSHER_TOKEN,
-            "content": content,
-            "summary": title,
-            "contentType": 3,
-            "uids": [WXPUSHER_UID],
-        },
-        timeout=15,
-    )
-    result = resp.json()
-    print(f"[WxPusher] 推送至 uid={mask(WXPUSHER_UID)} | "
-          f"{result.get('msg')} | success={result.get('success')}")
-
+def wxpush(title: str, content: str):
+    import urllib.request
+    payload = json.dumps({
+        "appToken":    WXPUSHER_TOKEN,
+        "content":     content,
+        "summary":     title,
+        "contentType": 3,
+        "uids":        [WXPUSHER_UID],
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            "https://wxpusher.zjiecode.com/api/send/message",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+            if result.get("success"):
+                log.info("📨 WxPusher 推送成功")
+            else:
+                log.warning(f"📨 WxPusher 推送失败: {result}")
+    except Exception as e:
+        log.warning(f"📨 WxPusher 推送异常: {e}")
 
 # ─────────────────────────────────────────────────────────────
-# Step A: 探测页面，动态发现 OAuth 参数；若发现新 client_id 则预警
+# Discord Token 注入工具
 # ─────────────────────────────────────────────────────────────
-def discover_oauth_params(session) -> dict:
-    params = {
-        "client_id":     DISCORD_CLIENT_ID,
-        "redirect_uri":  DISCORD_REDIRECT_URI,
-        "response_type": "code",
-        "scope":         "identify email guilds",
-    }
+def inject_discord_token(page, token: str):
+    """向 Discord 页面注入 Token（localStorage），然后刷新"""
+    page.evaluate("""(token) => {
+        const f = document.createElement('iframe');
+        f.style.display = 'none';
+        document.body.appendChild(f);
+        f.contentWindow.localStorage.setItem('token', '"' + token + '"');
+        try { localStorage.setItem('token', '"' + token + '"'); } catch(e) {}
+        document.body.removeChild(f);
+    }""", token)
+    log.info("Token 已注入 localStorage")
 
-    print("[A] 访问 /auth 探测页面结构 ...")
-    r = session.get("https://optiklink.net/auth", timeout=15,
-                    headers=HEADERS_BROWSER, allow_redirects=True)
+# ─────────────────────────────────────────────────────────────
+# Discord OAuth 授权页处理（参考 FreezeHost）
+# 自动向下滚动直到授权按钮可见，然后点击
+# ─────────────────────────────────────────────────────────────
+def handle_oauth_page(page):
+    log.info("处理 Discord OAuth 授权页...")
+    page.wait_for_timeout(2000)
 
-    print(f"    状态码: {r.status_code}  最终URL: {r.url}")
-    print(f"    响应体长度: {len(r.text)} 字节")
-    print("─" * 40)
+    # 等待授权按钮出现（最多等 30 次 × 0.8s）
+    for _ in range(30):
+        if "discord.com" not in page.url:
+            log.info("已离开 Discord，OAuth 完成")
+            return
 
-    found_from_page = False
+        btn_text = ""
+        try:
+            for sel in ['button[type="submit"]', 'div[class*="footer"] button', 'button[class*="primary"]']:
+                btn = page.locator(sel).last
+                if btn.is_visible():
+                    btn_text = btn.inner_text().strip().lower()
+                    break
+        except Exception:
+            pass
 
-    for pat in [
-        r'https?://discord\.com(?:/api)?/oauth2/authorize[^\s\'"<>\\]+',
-        r'https?://discord\.com/oauth2/authorize[^\s\'"<>\\]+',
-    ]:
-        m = re.search(pat, r.text)
-        if m:
-            raw_url = m.group(0).replace("&amp;", "&").rstrip("\\)\"'")
-            print(f"    发现 OAuth URL（已截断）: {raw_url[:60]}...")
-            parsed = urlparse(raw_url)
-            qs = parse_qs(parsed.query)
-            for key in ("client_id", "redirect_uri", "scope", "state"):
-                if qs.get(key):
-                    params[key] = qs[key][0]
-            found_from_page = True
+        if "authorize" in btn_text or "授权" in btn_text:
             break
 
-    if "discord.com" in r.url:
-        print(f"    页面直接跳转到 Discord: {r.url[:60]}...")
-        qs = parse_qs(urlparse(r.url).query)
-        for key in ("client_id", "redirect_uri", "scope", "state"):
-            if qs.get(key):
-                params[key] = qs[key][0]
-        found_from_page = True
+        # 滚动页面让授权按钮出现
+        page.evaluate("""() => {
+            const sels = ['[class*="scroller"]','[class*="oauth2"]','[class*="permissionList"]',
+                '[class*="content"] [class*="scroll"]','[class*="listScroller"]'];
+            for (const sel of sels) {
+                for (const el of document.querySelectorAll(sel)) {
+                    const s = getComputedStyle(el);
+                    if (el.scrollHeight > el.clientHeight &&
+                        ['auto','scroll'].some(v => s.overflowY === v || s.overflow === v))
+                        { el.scrollTop = el.scrollHeight; }
+                }
+            }
+            scrollTo(0, document.body.scrollHeight);
+        }""")
+        page.wait_for_timeout(800)
 
-    if not found_from_page:
-        print("    未从页面找到 OAuth URL，使用配置参数（环境变量/默认值）")
-
-    if params.get("client_id") and params["client_id"] != DISCORD_CLIENT_ID:
-        new_cid = params["client_id"]
-        print(f"    ⚠️  页面 client_id 已变更！配置值={mask(DISCORD_CLIENT_ID, 6)}  "
-              f"页面新值={mask(new_cid, 6)}")
-        print(f"    ✅  已自动切换为新 client_id，本次直接使用新值继续执行")
-
-        github_output = os.environ.get("GITHUB_OUTPUT", "")
-        if github_output:
-            with open(github_output, "a") as f:
-                f.write(f"new_client_id={new_cid}\n")
-            print(f"    📝  已写入 GITHUB_OUTPUT，workflow 将自动更新 Secret")
-
-        try:
-            wxpusher_send(
-                "⚠️ OptikLink client_id 已变更（已自动处理）",
-                f"## client_id 已变更\n\n"
-                f"| | 值（已脱敏）|\n|---|---|\n"
-                f"| 旧值 | `{mask(DISCORD_CLIENT_ID, 6)}` |\n"
-                f"| 新值 | `{mask(new_cid, 6)}` |\n\n"
-                f"✅ **本次已自动切换为新值执行，Secret 也将自动更新，无需手动操作。**\n\n"
-                f"时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
-            )
-        except Exception as pe:
-            print(f"    client_id 预警推送失败: {pe}")
-
-    safe_params = {
-        k: (mask(v, 6) if k in ("client_id", "redirect_uri") else v)
-        for k, v in params.items()
-    }
-    print(f"    最终 OAuth 参数（已脱敏）: {safe_params}")
-    return params
-
+    # 点击授权按钮
+    for _ in range(10):
+        if "discord.com" not in page.url:
+            return
+        for sel in [
+            'button:has-text("Authorize")',
+            'button:has-text("授权")',
+            'button[type="submit"]',
+            'div[class*="footer"] button',
+            'button[class*="primary"]',
+        ]:
+            try:
+                btn = page.locator(sel).last
+                if not btn.is_visible():
+                    continue
+                text = btn.inner_text().strip()
+                if any(k in text.lower() for k in ("取消", "cancel", "deny")):
+                    continue
+                if btn.is_disabled():
+                    page.wait_for_timeout(1000)
+                    break
+                log.info(f"点击授权按钮: {text}")
+                btn.click()
+                page.wait_for_timeout(2000)
+                if "discord.com" not in page.url:
+                    return
+                break
+            except Exception:
+                continue
+        page.wait_for_timeout(1500)
 
 # ─────────────────────────────────────────────────────────────
-# Step B: Discord Token 授权
+# 主登录流程
 # ─────────────────────────────────────────────────────────────
-def discord_authorize(oauth_params: dict) -> str:
-    print("[B] 向 Discord 提交 OAuth 授权 ...")
-    post_params = {k: oauth_params[k]
-                   for k in ("client_id", "redirect_uri", "response_type", "scope")
-                   if k in oauth_params}
-    if "state" in oauth_params:
-        post_params["state"] = oauth_params["state"]
-
-    import requests
-    r = requests.post(
-        "https://discord.com/api/v10/oauth2/authorize",
-        params=post_params,
-        json={"authorize": True, "permissions": "0"},
-        headers={
-            "Authorization": DISCORD_TOKEN,
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://discord.com/oauth2/authorize?" + urlencode(post_params),
-            "X-Super-Properties": "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIn0=",
-            "X-Discord-Locale": "en-US",
-        },
-        timeout=15,
-        allow_redirects=False,
-    )
-
-    print(f"    Discord 状态: {r.status_code}")
+def do_login(page) -> bool:
+    """
+    1. 打开 /auth 页面
+    2. 点击 Discord 登录按钮
+    3. 到达 discord.com 后注入 Token 并刷新
+    4. 处理 OAuth 授权页
+    5. 等待跳回 optiklink.net/home
+    """
+    log.info(f"[A] 打开登录页: {AUTH_URL}")
     try:
-        data = r.json()
-    except Exception:
-        data = {}
-
-    safe_data = dict(data)
-    if "location" in safe_data:
-        loc_masked = re.sub(r'(code|token|access_token)=[^&]+', r'\1=***', safe_data["location"])
-        safe_data["location"] = loc_masked
-    print(f"    Discord body（已脱敏）: {str(safe_data)[:300]}")
-
-    if r.status_code == 200 and "location" in data:
-        return data["location"]
-
-    if r.status_code in (301, 302, 303, 307, 308):
-        loc = r.headers.get("Location", "")
-        if loc:
-            loc_log = re.sub(r'(code|token|access_token)=[^&]+', r'\1=***', loc)
-            print(f"    重定向 Location（已脱敏）: {loc_log[:100]}")
-            return loc
-
-    raise RuntimeError(
-        f"Discord 授权失败 (HTTP {r.status_code})\n"
-        "可能原因：①Token 失效或格式错误 ②账号被限制 ③client_id/redirect_uri 不匹配"
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-# Step C: 回调（使用 cloudscraper 会话自动绕过 Cloudflare）
-# ─────────────────────────────────────────────────────────────
-def optiklink_callback(session, callback_url: str):
-    url_log = re.sub(r'(code|token)=[^&]+', r'\1=***', callback_url)
-    print(f"[C] 访问回调 URL（已脱敏）: {url_log[:100]} ...")
-
-    current_url = callback_url
-    max_redirects = 10
-
-    for i in range(max_redirects):
-        resp = session.get(current_url, timeout=15,
-                           headers=HEADERS_BROWSER, allow_redirects=False)
-        url_masked = re.sub(r'(code|token|access_token)=[^&\s]+', r'\1=***', resp.url)
-        print(f"    跳转 #{i+1}: 状态码 {resp.status_code}, URL={url_masked[:80]}")
-        if resp.status_code in (301, 302, 303, 307, 308):
-            location = resp.headers.get("Location")
-            if not location:
-                err_url = re.sub(r'(code|token|access_token)=[^&\s]+', r'\1=***', resp.url)
-                raise RuntimeError(f"重定向无 Location 头: {err_url}")
-            if location.startswith("/"):
-                from urllib.parse import urljoin
-                location = urljoin(current_url, location)
-            current_url = location
-            continue
-        final_resp = resp
-        break
-    else:
-        raise RuntimeError("重定向次数超过限制")
-
-    final_url_masked = re.sub(r'(code|token|access_token)=[^&\s]+', r'\1=***', final_resp.url)
-    print(f"    最终状态码: {final_resp.status_code}  最终URL: {final_url_masked[:100]}")
-    if final_resp.status_code >= 400:
-        body_preview = final_resp.text[:200].replace("\n", " ")
-        print(f"    响应体预览（前200字符）: {body_preview}")
-        raise RuntimeError(f"回调失败，HTTP {final_resp.status_code}")
-
-
-# ─────────────────────────────────────────────────────────────
-# 截图功能（需要 ENABLE_SCREENSHOT=true 环境变量）
-# ─────────────────────────────────────────────────────────────
-ENABLE_SCREENSHOT = os.environ.get("ENABLE_SCREENSHOT", "false").lower() == "true"
-
-def take_screenshot(url: str, filename: str, cookies=None):
-    """用 playwright 对指定 URL 截图，保存为 filename"""
-    if not ENABLE_SCREENSHOT:
-        return
-    try:
-        from playwright.sync_api import sync_playwright
-        print(f"    [截图] 正在截图: {url} -> {filename}")
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent=HEADERS_BROWSER["User-Agent"],
-            )
-            if cookies:
-                context.add_cookies(cookies)
-            page = context.new_page()
-            page.goto(url, timeout=30000, wait_until="networkidle")
-            page.screenshot(path=filename, full_page=True)
-            browser.close()
-        print(f"    [截图] 已保存: {filename}")
+        page.goto(AUTH_URL, timeout=30000, wait_until="domcontentloaded")
     except Exception as e:
-        print(f"    [截图] 失败: {e}")
+        log.warning(f"goto 超时: {e}")
+    take_screenshot(page, "01_auth_page")
 
+    # 点击 Discord 登录按钮
+    log.info("[B] 点击 Discord 登录按钮...")
+    try:
+        # OptikLink 的按钮文字是 "DISCORD" 或包含 discord
+        for sel in [
+            'a:has-text("DISCORD")',
+            'button:has-text("DISCORD")',
+            'a[href*="discord"]',
+            'a[href*="oauth2"]',
+            '.discord-btn',
+            'a:has-text("Sign in with Discord")',
+            'a:has-text("Login with Discord")',
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if btn.is_visible(timeout=2000):
+                    btn.click()
+                    log.info(f"已点击: {sel}")
+                    break
+            except Exception:
+                continue
+    except Exception as e:
+        log.warning(f"点击登录按钮失败: {e}")
+        take_screenshot(page, "01b_click_fail")
+        return False
 
-def session_to_playwright_cookies(session, url: str) -> list:
-    """把 requests session 的 cookies 转换为 playwright 格式"""
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    domain = parsed.netloc
-    result = []
-    for c in session.cookies:
-        result.append({
-            "name": c.name,
-            "value": c.value,
-            "domain": c.domain or domain,
-            "path": c.path or "/",
-        })
-    return result
+    # 等待跳转到 discord.com
+    log.info("[C] 等待跳转到 Discord...")
+    try:
+        page.wait_for_url(re.compile(r"discord\.com"), timeout=15000)
+        log.info(f"已到达 Discord: {page.url}")
+    except Exception as e:
+        log.warning(f"等待 Discord 超时: {e}，当前URL: {page.url}")
+        take_screenshot(page, "02_discord_timeout")
+        return False
 
+    take_screenshot(page, "02_discord_page")
+
+    # 注入 Token
+    log.info("[D] 注入 Discord Token...")
+    inject_discord_token(page, DISCORD_TOKEN)
+    page.reload(wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(3000)
+
+    # 检查 Token 注入是否成功
+    if re.search(r"discord\.com/login", page.url):
+        log.error("Token 注入失败，仍在登录页")
+        take_screenshot(page, "03_token_failed")
+        return False
+    log.info("Token 注入成功")
+    take_screenshot(page, "03_token_injected")
+
+    # 处理 OAuth 授权页
+    try:
+        page.wait_for_url(re.compile(r"discord\.com/oauth2/authorize"), timeout=6000)
+        page.wait_for_timeout(2000)
+        if "discord.com" in page.url:
+            handle_oauth_page(page)
+    except Exception:
+        # 可能已经自动跳过了授权页
+        if "discord.com" in page.url:
+            handle_oauth_page(page)
+
+    take_screenshot(page, "04_after_oauth")
+
+    # 等待跳回 optiklink.net
+    log.info("[E] 等待跳回 OptikLink...")
+    try:
+        page.wait_for_url(re.compile(r"optiklink\.net"), timeout=20000)
+        log.info(f"已跳回: {page.url}")
+    except Exception as e:
+        log.warning(f"等待跳回超时: {e}，当前URL: {page.url}")
+        take_screenshot(page, "05_redirect_timeout")
+        return False
+
+    # 确保到达 /home
+    if "/home" not in page.url:
+        log.info("跳转到 /home ...")
+        try:
+            page.goto(HOME_URL, timeout=20000, wait_until="domcontentloaded")
+        except Exception as e:
+            log.warning(f"goto /home 超时: {e}")
+
+    take_screenshot(page, "05_home_page")
+    return True
 
 # ─────────────────────────────────────────────────────────────
-# Step D: Dashboard
+# 读取 Dashboard 信息
 # ─────────────────────────────────────────────────────────────
-def check_dashboard(session) -> dict:
-    print("[D] 访问 Dashboard ...")
-    r = session.get("https://optiklink.net/home", timeout=15,
-                    headers=HEADERS_BROWSER, allow_redirects=True)
-    print(f"    状态码: {r.status_code}  最终URL: {r.url}")
+def read_dashboard(page) -> dict:
+    log.info("[F] 读取 Dashboard 信息...")
+    info = {
+        "logged_in":      False,
+        "username":       "N/A",
+        "expire_date":    EXPIRE_DATE,
+        "running_servers": "N/A",
+    }
 
-    info = {"logged_in": False, "username": "N/A",
-            "expire_date": EXPIRE_DATE, "running_servers": "N/A"}
-    html = r.text
+    try:
+        page.wait_for_timeout(3000)
+        html = page.content()
+        text = page.inner_text("body")
+    except Exception as e:
+        log.warning(f"读取页面失败: {e}")
+        return info
 
-    # 调试：打印页面前1500字符，帮助分析结构
-    print("    ── HTML 预览（前1500字符）──")
-    print(html[:1500])
-    print("    ── HTML 预览结束 ──")
-
-    if "DASHBOARD" in html.upper():
+    # 判断是否登录
+    if "dashboard" in page.url.lower() or "DASHBOARD" in html.upper() or "My Plan" in text:
         info["logged_in"] = True
+        log.info("✅ 确认已登录")
+    else:
+        log.warning(f"当前URL: {page.url}，未检测到 Dashboard")
+        return info
 
-        # 用户名：多种模式尝试
-        for pat in [
-            r'Welcome\s+<[^>]+>([^<]+)</[^>]+>\s+to your Dashboard',
-            r'"username"\s*:\s*"([^"]+)"',
-            r'Welcome\s+(\w+)\s+to',
-            r'simeter\w*',
-        ]:
-            m = re.search(pat, html, re.I)
-            if m:
-                info["username"] = m.group(1) if m.lastindex else m.group(0)
-                break
+    # 用户名
+    for pat in [
+        r'Welcome\s+(?:<[^>]+>)?(\w+)(?:<[^>]+>)?\s+to',
+        r'"username"\s*:\s*"([^"]+)"',
+        r'simeter\w+',
+        r'Hello,?\s+(\w+)',
+    ]:
+        m = re.search(pat, html, re.I)
+        if m:
+            info["username"] = m.group(1) if m.lastindex else m.group(0)
+            break
 
-        # 运行服务器数量：多种模式
-        for pat2 in [
-            r'(\d+)\s+servers?',
-            r'RUNNING SERVERS[^>]*>.*?(\d+)',
-            r'running[_\-]?servers?["\s:]+(\d+)',
-        ]:
-            m2 = re.search(pat2, html, re.I)
-            if m2:
-                info["running_servers"] = m2.group(1)
-                break
+    # 到期日期（优先从页面文字提取）
+    for pat in [
+        r'(\d{2}\.\d{2}\.\d{4})',
+        r'date:\s*(\d{2}\.\d{2}\.\d{4})',
+        r'expire[^:]*:\s*(\d{2}\.\d{2}\.\d{4})',
+    ]:
+        m = re.search(pat, text, re.I)
+        if m:
+            info["expire_date"] = m.group(1)
+            break
 
-        # 到期日期：多种模式
-        for pat3 in [
-            r'(\d{2}\.\d{2}\.\d{4})',          # 11.06.2026
-            r'(\d{4}-\d{2}-\d{2})',             # 2026-06-11
-            r'expire[^>]*>.*?(\d{2}\.\d{2}\.\d{4})',
-            r'SERVICE EXPIRE[^:]*:.*?(\d{2}\.\d{2}\.\d{4})',
-        ]:
-            m3 = re.search(pat3, html, re.I)
-            if m3:
-                val = m3.group(1)
-                # 如果是 yyyy-mm-dd 格式，转换为 dd.mm.yyyy
-                if re.match(r'\d{4}-\d{2}-\d{2}', val):
-                    parts = val.split("-")
-                    val = f"{parts[2]}.{parts[1]}.{parts[0]}"
-                info["expire_date"] = val
-                break
+    # 运行服务器数
+    m2 = re.search(r'(\d+)\s*(?:running\s*)?servers?', text, re.I)
+    if m2:
+        info["running_servers"] = m2.group(1)
 
-    # 截图
-    if ENABLE_SCREENSHOT:
-        pw_cookies = session_to_playwright_cookies(session, "https://optiklink.net")
-        take_screenshot("https://optiklink.net/home", "dashboard.png", cookies=pw_cookies)
-
-    print(f"    信息: {info}")
+    log.info(f"Dashboard 信息: {info}")
     return info
 
-
 # ─────────────────────────────────────────────────────────────
-# 推送消息（含分级到期提醒）
+# 构建推送消息
 # ─────────────────────────────────────────────────────────────
 def build_message(info: dict) -> tuple[str, str]:
     now_utc = datetime.now(timezone.utc)
-    if info.get("expire_date"):
-        expire_dt = datetime.strptime(info["expire_date"], "%d.%m.%Y").replace(tzinfo=timezone.utc)
-        days_left = (expire_dt - now_utc).days
-    else:
-        expire_dt = None
-        days_left = -1
     status = "✅ 登录成功" if info["logged_in"] else "❌ 登录失败"
+
+    days_left = -1
+    if info.get("expire_date"):
+        try:
+            expire_dt = datetime.strptime(info["expire_date"], "%d.%m.%Y").replace(tzinfo=timezone.utc)
+            days_left = (expire_dt - now_utc).days
+        except Exception:
+            pass
 
     if days_left == -1:
         warning = "\n\n> ⚠️ 未能获取到期日期，请手动检查"
         title = f"OptikLink 签到 | {status} | 到期日期未知"
     elif days_left <= 3:
-        warning = (
-            f"\n\n---\n"
-            f"## 🚨🚨🚨 紧急：服务即将到期！\n\n"
-            f"> **距到期仅剩 {days_left} 天，请立即续期，否则服务将中断！**"
-        )
+        warning = f"\n\n---\n## 🚨 紧急：服务即将到期！\n\n> **距到期仅剩 {days_left} 天，请立即续期！**"
         title = f"🚨 OptikLink 签到 | 紧急：{days_left}天后到期！"
     elif days_left <= 7:
-        warning = (
-            f"\n\n---\n"
-            f"## ⚠️ 警告：服务即将到期\n\n"
-            f"> 距到期还剩 **{days_left}** 天，请尽快安排续期。"
-        )
+        warning = f"\n\n---\n## ⚠️ 服务即将到期\n\n> 距到期还剩 **{days_left}** 天，请尽快续期。"
         title = f"⚠️ OptikLink 签到 | 警告：{days_left}天后到期"
     else:
         warning = f"\n\n> 📅 服务到期还剩 **{days_left}** 天" if days_left <= 30 else ""
@@ -415,67 +366,65 @@ def build_message(info: dict) -> tuple[str, str]:
 | 用户名 | {info['username']} |
 | 运行服务器 | {info['running_servers']} 个 |
 | 服务到期 | {info['expire_date']} |
-| 剩余天数 | {days_left} 天 |
+| 剩余天数 | {days_left if days_left >= 0 else '未知'} 天 |
 | 执行时间 | {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC |
 {warning}
 """
     return title, content
 
-
 # ─────────────────────────────────────────────────────────────
 # 主流程
 # ─────────────────────────────────────────────────────────────
 def main():
-    print("=" * 55)
-    print("  OptikLink 自动登录脚本  v3")
-    print("=" * 55)
-    print(f"  DISCORD_TOKEN      : ***")
-    print(f"  WXPUSHER_TOKEN     : ***")
-    print(f"  WXPUSHER_UID       : ***")
-    print(f"  DISCORD_CLIENT_ID  : ***")
-    # 完全隐藏 redirect_uri，不显示任何真实字符
-    print(f"  DISCORD_REDIRECT_URI: ***")
-    # 如果 EXPIRE_DATE 为空，显示“未设置”
-    print(f"  EXPIRE_DATE        : ***")
-    print("=" * 55)
+    log.info("=" * 55)
+    log.info("  OptikLink 自动登录脚本 v4 (CloakBrowser)")
+    log.info("=" * 55)
 
-    if USE_CLOUDSCRAPER:
-        session = cloudscraper.create_scraper()
-    else:
-        import requests
-        session = requests.Session()
-        print("[警告] 使用普通 requests.Session，可能无法绕过 Cloudflare 验证")
+    from cloakbrowser import launch
 
-    # 如果配置了 V2Ray SOCKS5 代理，让 session 走代理出去
-    proxy_url = os.environ.get("PROXY_URL", "")
-    if proxy_url:
-        session.proxies = {"http": proxy_url, "https": proxy_url}
-        print(f"[信息] 已启用代理: {proxy_url}")
-    else:
-        print("[信息] 未配置代理，直连出口")
+    log.info("启动 CloakBrowser...")
+    browser = launch(
+        headless=True,
+        humanize=True,
+        proxy=PROXY_URL,
+        geoip=True,
+    )
+    page = browser.new_page()
 
     try:
-        oauth_params   = discover_oauth_params(session)
-        callback_url   = discord_authorize(oauth_params)
-        optiklink_callback(session, callback_url)
-        info           = check_dashboard(session)
-        title, content = build_message(info)
-        wxpusher_send(title, content)
-        if not info["logged_in"]:
-            raise RuntimeError("Dashboard 未出现，登录可能失败，请查看日志")
-        print("\n✅ 全部完成！")
-    except Exception as e:
-        err_msg = str(e)
-        print(f"\n❌ 出错: {err_msg}")
-        try:
-            wxpusher_send(
+        success = do_login(page)
+
+        if not success:
+            wxpush(
                 "OptikLink 签到 ❌ 失败",
-                f"## 执行失败\n\n**错误：**\n```\n{err_msg}\n```\n"
+                f"## 执行失败\n\n**错误：** 登录流程未完成，请查看截图\n\n"
                 f"时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
             )
-        except Exception as pe:
-            print(f"WxPusher 推送失败: {pe}")
+            sys.exit(1)
+
+        info = read_dashboard(page)
+        title, content = build_message(info)
+        wxpush(title, content)
+
+        if not info["logged_in"]:
+            log.error("Dashboard 未出现登录状态")
+            sys.exit(1)
+
+        log.info("✅ 全部完成！")
+
+    except Exception as e:
+        log.exception(e)
+        take_screenshot(page, "99_error")
+        wxpush(
+            "OptikLink 签到 ❌ 异常",
+            f"## 执行异常\n\n```\n{e}\n```\n\n"
+            f"时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        )
         sys.exit(1)
+    finally:
+        time.sleep(3)
+        browser.close()
+        log.info("浏览器已关闭")
 
 
 if __name__ == "__main__":
