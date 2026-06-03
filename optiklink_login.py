@@ -263,7 +263,7 @@ def optiklink_callback(session, callback_url: str):
 # ─────────────────────────────────────────────────────────────
 def check_dashboard(session) -> dict:
     print("[D] 访问 Dashboard ...")
-    r = session.get("https://optiklink.net", timeout=15,
+    r = session.get("https://optiklink.net/home", timeout=15,
                     headers=HEADERS_BROWSER, allow_redirects=True)
     print(f"    状态码: {r.status_code}  最终URL: {r.url}")
 
