@@ -6,9 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       enable_screenshot:
-        description: '是否截图（true/false）'
+        description: '是否截图'
         required: false
-        default: 'false'
+        default: '否'
+        type: choice
+        options:
+          - '否'
+          - '是'
 
 jobs:
   auto-login:
@@ -30,7 +34,7 @@ jobs:
         run: pip install requests cloudscraper "requests[socks]"
 
       - name: 安装 Playwright（仅截图模式）
-        if: github.event.inputs.enable_screenshot == 'true'
+        if: github.event.inputs.enable_screenshot == '是'
         run: |
           pip install playwright
           playwright install chromium
@@ -62,11 +66,11 @@ jobs:
           DISCORD_REDIRECT_URI: ${{ secrets.DISCORD_REDIRECT_URI }}
           EXPIRE_DATE:          ${{ secrets.EXPIRE_DATE }}
           PROXY_URL:            "socks5h://127.0.0.1:10808"
-          ENABLE_SCREENSHOT:    ${{ github.event.inputs.enable_screenshot || 'false' }}
+          ENABLE_SCREENSHOT:    ${{ github.event.inputs.enable_screenshot == '是' && 'true' || 'false' }}
         run: python optiklink_login.py
 
       - name: 上传截图（仅截图模式）
-        if: github.event.inputs.enable_screenshot == 'true' && always()
+        if: github.event.inputs.enable_screenshot == '是' && always()
         uses: actions/upload-artifact@v4
         with:
           name: dashboard-screenshot
