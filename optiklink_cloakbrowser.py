@@ -3,11 +3,13 @@ OptikLink 每日自动登录脚本 v4.6 (CloakBrowser版)
 原理：用 CloakBrowser 打开页面，注入 Discord Token 完成 OAuth2 授权
 
 修复记录 v4.6:
-  - 【录屏修复】抛弃 threading + page.screenshot() 方案（greenlet 跨线程错误）
-    改为 subprocess 调 import/scrot 截取 Xvfb 屏幕，完全绕开 Playwright 线程限制
+  - 【录屏修复】抛弃 scrot/import 逐帧截屏方案（黑屏问题）
+    改用 ffmpeg x11grab 直接从 Xvfb :99 录制视频流，无需逐帧截图再合成
+    后台进程用 Popen 管理，彻底绕开 Playwright 线程限制
   - 【弹窗修复】新增 Google Vignette 弹窗广告自动关闭逻辑
     点击 Discord 按钮后检测 #google_vignette 并逐层关闭所有遮罩层
   - 新增通用弹窗/广告拦截器，在页面加载后自动清除常见广告弹窗
+  - Discord OAuth 授权页增强：新增 "同意" 按钮处理，支持中文界面
 
 修复记录 v4.5:
   - 新增录屏功能：环境变量 ENABLE_SCREENRECORD=true 开启，默认 false
@@ -74,204 +76,92 @@ def take_screenshot(page, name: str):
         log.warning(f"截图失败: {e}")
 
 # ─────────────────────────────────────────────────────────────
-# 录屏 v4.6 — 改用 subprocess + import/scrot 截 Xvfb 屏幕
-# 原因：Playwright sync_api 绑定 greenlet，不能从 threading.Thread 调用
+# 录屏 v4.6 — 用 ffmpeg x11grab 直接从 Xvfb :99 录制视频流
+# 原因：scrot/import 截 Xvfb 常出现黑屏；ffmpeg x11grab 直接抓显示流更可靠
+# 后台 Popen 不接触任何 Playwright 对象，彻底绕开 greenlet 限制
 # ─────────────────────────────────────────────────────────────
 RECORDING_DIR = Path("./recordings")
 RECORDING_DIR.mkdir(exist_ok=True)
 
-# 运行时探测可用的截屏命令（按优先级）
-def _detect_screen_capture_cmd():
-    """探测可用的 X11 截屏工具，返回 (cmd_args_template, 说明) """
-    candidates = [
-        # import: ImageMagick 的 X11 截屏工具，最可靠
-        (["import", "-window", "root", "-display", ":99"], "import"),
-        # scrot: 轻量级截屏工具
-        (["scrot", "--display", ":99", "--silent"], "scrot"),
-        # xwd: X11 原生 dump，兼容性最好但输出是 XWD 格式
-        (["xwd", "-root", "-display", ":99"], "xwd"),
-    ]
-    for args, name in candidates:
-        try:
-            result = subprocess.run(
-                ["which", args[0]], capture_output=True, text=True, timeout=3
-            )
-            if result.returncode == 0:
-                log.info(f"🎬 录屏工具: {name} ({result.stdout.strip()})")
-                return args, name
-        except Exception:
-            continue
-    log.warning("⚠️ 未找到任何 X11 截屏工具（import/scrot/xwd），录屏将不可用")
-    return None, None
-
-_SCREEN_CAPTURE_ARGS, _SCREEN_CAPTURE_NAME = (None, None)  # 延迟初始化
-
 
 def start_page_recording(page=None):
     """
-    开始录屏 — 用 subprocess 调 import/scrot/xwd 定时截取 Xvfb 虚拟屏幕 :99。
-    后台线程不接触任何 Playwright 对象，彻底绕开 greenlet 限制。
+    开始录屏 — 用 ffmpeg x11grab 直接从 Xvfb :99 录制视频流。
+    无需逐帧截图再合成，一条命令搞定。
     page 参数保留以兼容旧调用，实际不使用。
     """
-    global _SCREEN_CAPTURE_ARGS, _SCREEN_CAPTURE_NAME
-
     if not ENABLE_SCREENRECORD:
         return None
 
-    # 延迟探测截屏工具
-    if _SCREEN_CAPTURE_ARGS is None:
-        _SCREEN_CAPTURE_ARGS, _SCREEN_CAPTURE_NAME = _detect_screen_capture_cmd()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = str(RECORDING_DIR / f"{ts}_recording.mp4")
 
-    if _SCREEN_CAPTURE_ARGS is None:
-        log.error("🎬 录屏已启用但无可用截屏工具，跳过录屏")
+    # ffmpeg x11grab：直接从 X11 显示抓取视频流
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "x11grab",
+        "-video_size", f"{VIEWPORT_W}x{VIEWPORT_H}",
+        "-framerate", "2",
+        "-i", ":99",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "ultrafast",
+        "-crf", "28",
+        out_path,
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        log.info(f"🎬 录屏已开始 (ffmpeg x11grab :99) → {out_path}")
+    except FileNotFoundError:
+        log.error("🎬 ffmpeg 未安装，录屏不可用")
+        return None
+    except Exception as e:
+        log.error(f"🎬 启动录屏失败: {e}")
         return None
 
-    import threading
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    frame_dir = RECORDING_DIR / f"frames_{ts}"
-    frame_dir.mkdir(exist_ok=True)
-
-    rec = {
-        "ts":        ts,
-        "frame_dir": str(frame_dir),
-        "running":   True,
-        "count":     0,
-        "thread":    None,
-        "tool":      _SCREEN_CAPTURE_NAME,
-    }
-
-    capture_args = _SCREEN_CAPTURE_ARGS  # 闭包捕获
-
-    def _capture():
-        idx = 0
-        while rec["running"]:
-            path = str(frame_dir / f"frame_{idx:05d}.png")
-            try:
-                if capture_args[0] == "xwd":
-                    # xwd 输出 XWD 格式，需要管道给 convert 转 PNG
-                    result = subprocess.run(
-                        ["xwd", "-root", "-display", ":99"],
-                        capture_output=True,
-                        timeout=5,
-                    )
-                    if result.returncode == 0:
-                        subprocess.run(
-                            ["convert", "xwd:-", path],
-                            input=result.stdout,
-                            capture_output=True,
-                            timeout=5,
-                        )
-                else:
-                    subprocess.run(
-                        capture_args + [path],
-                        capture_output=True,
-                        timeout=5,
-                    )
-            except Exception:
-                pass  # 帧截图失败不中断录屏
-            idx += 1
-            time.sleep(0.5)
-        rec["count"] = idx
-
-    t = threading.Thread(target=_capture, daemon=True)
-    t.start()
-    rec["thread"] = t
-    log.info(f"🎬 录屏已开始（{_SCREEN_CAPTURE_NAME} 截屏 :99），帧目录: {frame_dir}")
-    return rec
+    return {"ts": ts, "proc": proc, "path": out_path}
 
 
 def stop_page_recording(rec):
     """
-    停止录屏，用 ffmpeg 将 PNG 帧合成为 MP4。
-    保留帧目录供手动查看作为后备方案。
+    停止 ffmpeg 录屏进程。
     """
     if rec is None:
         return
 
-    rec["running"] = False
-    if rec.get("thread"):
-        rec["thread"].join(timeout=3)
+    proc = rec.get("proc")
+    path = rec.get("path", "unknown")
 
-    frame_dir = Path(rec["frame_dir"])
-    ts        = rec["ts"]
-    count     = rec["count"]
-    log.info(f"🎬 录屏停止，共采集 {count} 帧")
-
-    if count == 0:
-        log.warning("录屏无帧，跳过合成（截屏工具可能不可用或 DISPLAY 未设置）")
-        return
-
-    frames_paths = sorted(frame_dir.glob("frame_*.png"))
-    if len(frames_paths) == 0:
-        log.warning("帧目录为空，跳过合成")
-        return
-
-    # ── 方案 A：用 ffmpeg 合成 MP4 ──────────────────────────
-    out_path = str(RECORDING_DIR / f"{ts}_recording.mp4")
-    try:
-        cmd = [
-            "ffmpeg", "-y",
-            "-framerate", "2",                           # 2fps（与 500ms 间隔一致）
-            "-i", str(frame_dir / "frame_%05d.png"),
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", # 保证偶数尺寸
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-preset", "ultrafast",
-            out_path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode == 0:
-            log.info(f"🎬 MP4 已保存: {out_path}")
-            # 合成成功后清理帧目录节省空间
-            for p in frames_paths:
-                try:
-                    p.unlink()
-                except Exception:
-                    pass
-            try:
-                frame_dir.rmdir()
-            except Exception:
-                pass
-            return
-        else:
-            log.warning(f"ffmpeg 失败: {result.stderr[:300]}")
-    except FileNotFoundError:
-        log.warning("ffmpeg 未找到")
-    except subprocess.TimeoutExpired:
-        log.warning("ffmpeg 合成超时")
-    except Exception as e:
-        log.warning(f"ffmpeg 合成异常: {e}")
-
-    # ── 方案 B：用 Pillow 合成 GIF ──────────────────────────
-    try:
-        from PIL import Image
-        images = [Image.open(str(p)).convert("P", dither=Image.FLOYDSTEINBERG) for p in frames_paths]
-        out_gif = str(RECORDING_DIR / f"{ts}_recording.gif")
-        images[0].save(
-            out_gif,
-            save_all=True,
-            append_images=images[1:],
-            duration=500,
-            loop=0,
-            optimize=True,
-        )
-        log.info(f"🎬 已保存 GIF: {out_gif}")
-        for p in frames_paths:
-            try:
-                p.unlink()
-            except Exception:
-                pass
+    if proc and proc.poll() is None:
         try:
-            frame_dir.rmdir()
-        except Exception:
-            pass
-    except ImportError:
-        log.warning("Pillow 未安装")
-        log.info(f"🎬 帧目录保留供手动查看: {frame_dir}（共 {count} 帧）")
-    except Exception as e:
-        log.warning(f"GIF 合成失败: {e}")
-        log.info(f"🎬 帧目录保留供手动查看: {frame_dir}（共 {count} 帧）")
+            # 发送 'q' 让 ffmpeg 优雅退出
+            proc.stdin.write(b"q")
+            proc.stdin.flush()
+            proc.wait(timeout=15)
+            log.info(f"🎬 录屏已停止: {path}")
+        except subprocess.TimeoutExpired:
+            log.warning("ffmpeg 未在 15s 内退出，强制终止")
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception as e:
+            log.warning(f"停止录屏异常: {e}")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    # 检查输出文件
+    if Path(path).exists():
+        size_mb = Path(path).stat().st_size / (1024 * 1024)
+        log.info(f"🎬 录屏文件: {path} ({size_mb:.1f} MB)")
+    else:
+        log.warning(f"🎬 录屏文件未生成: {path}")
 
 # ─────────────────────────────────────────────────────────────
 # WxPusher 推送
@@ -321,8 +211,44 @@ def inject_discord_token(page, token: str):
 # ─────────────────────────────────────────────────────────────
 def handle_oauth_page(page):
     log.info("处理 Discord OAuth 授权页...")
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(3000)  # 多等一会让 JS 渲染完
 
+    # ── 先尝试点击外层可见的授权/同意按钮 ──
+    # Discord 中文版可能直接显示 "授权" 按钮，不需要滚动
+    for outer_sel in [
+        'button:has-text("授权")',
+        'button:has-text("Authorize")',
+        'button:has-text("同意")',
+        'button:has-text("Agree")',
+        'button:has-text("Continue")',
+        'button:has-text("继续")',
+        'button[type="submit"]',
+        'div[class*="footer"] button',
+        'button[class*="primary"]',
+        'button[class*="button"] span:has-text("授权")',
+    ]:
+        try:
+            btn = page.locator(outer_sel).last
+            if not btn.is_visible(timeout=1500):
+                continue
+            text = btn.inner_text(timeout=500).strip()
+            if not text:
+                continue
+            # 跳过取消/拒绝按钮
+            if any(k in text.lower() for k in ("取消", "cancel", "deny", "拒绝", "decline")):
+                continue
+            if btn.is_disabled():
+                continue
+            log.info(f"点击授权/同意按钮: {text}")
+            btn.click()
+            page.wait_for_timeout(2000)
+            if "discord.com" not in page.url:
+                log.info("已离开 Discord，OAuth 完成")
+                return
+        except Exception:
+            continue
+
+    # ── 如果外层按钮没找到，滚动权限列表找底部按钮 ──
     for _ in range(30):
         if "discord.com" not in page.url:
             log.info("已离开 Discord，OAuth 完成")
@@ -338,9 +264,10 @@ def handle_oauth_page(page):
         except Exception:
             pass
 
-        if "authorize" in btn_text or "授权" in btn_text:
+        if "authorize" in btn_text or "授权" in btn_text or "同意" in btn_text:
             break
 
+        # 滚动权限列表
         page.evaluate("""() => {
             const sels = ['[class*="scroller"]','[class*="oauth2"]','[class*="permissionList"]',
                 '[class*="content"] [class*="scroll"]','[class*="listScroller"]',
@@ -364,31 +291,28 @@ def handle_oauth_page(page):
         }""")
         page.wait_for_timeout(800)
 
+    # ── 再尝试点击底部授权按钮 ──
     for _ in range(10):
         if "discord.com" not in page.url:
             return
         for sel in [
-            'button:has-text("Authorize")',
             'button:has-text("授权")',
+            'button:has-text("Authorize")',
+            'button:has-text("同意")',
+            'button:has-text("Agree")',
             'button[type="submit"]',
             'div[class*="footer"] button',
             'button[class*="primary"]',
         ]:
             try:
                 btn = page.locator(sel).last
-                if not btn.is_visible():
+                if not btn.is_visible(timeout=1000):
                     continue
-                text = btn.inner_text().strip()
-                if any(k in text.lower() for k in ("取消", "cancel", "deny")):
+                text = btn.inner_text(timeout=500).strip()
+                if not text:
                     continue
-                if "scroll" in text.lower():
-                    page.evaluate("""() => {
-                        document.querySelectorAll('div').forEach(el => {
-                            if (el.scrollHeight > el.clientHeight + 5) el.scrollTop = el.scrollHeight;
-                        }); scrollTo(0, document.body.scrollHeight);
-                    }""")
-                    page.wait_for_timeout(1000)
-                    break
+                if any(k in text.lower() for k in ("取消", "cancel", "deny", "拒绝", "decline")):
+                    continue
                 if btn.is_disabled():
                     page.wait_for_timeout(1000)
                     break
@@ -401,6 +325,8 @@ def handle_oauth_page(page):
             except Exception:
                 continue
         page.wait_for_timeout(1500)
+
+    log.warning("OAuth 授权页处理完毕，但可能未成功点击授权按钮")
 
 # ─────────────────────────────────────────────────────────────
 # v4.6 新增：关闭页面弹窗/广告
