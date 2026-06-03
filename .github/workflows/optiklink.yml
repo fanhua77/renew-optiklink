@@ -46,8 +46,6 @@ jobs:
           DISCORD_TOKEN:        ${{ secrets.DISCORD_TOKEN }}
           WXPUSHER_TOKEN:       ${{ secrets.WXPUSHER_TOKEN }}
           WXPUSHER_UID:         ${{ secrets.WXPUSHER_UID }}
-          DISCORD_CLIENT_ID:    ${{ secrets.DISCORD_CLIENT_ID }}
-          DISCORD_REDIRECT_URI: ${{ secrets.DISCORD_REDIRECT_URI }}
           EXPIRE_DATE:          ${{ secrets.EXPIRE_DATE }}
           PROXY_URL:            "socks5h://127.0.0.1:10808"
         run: python optiklink_login.py
