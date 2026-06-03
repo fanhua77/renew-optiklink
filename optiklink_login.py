@@ -1,7 +1,15 @@
 """
-OptikLink 每日自动登录脚本 v4 (CloakBrowser版)
+OptikLink 每日自动登录脚本 v4.1 (CloakBrowser版)
 原理：用 CloakBrowser 打开页面，注入 Discord Token 完成 OAuth2 授权
 参考：natfreecloud_renew_CloakBrowser / FreezeHost
+
+修复记录 v4.1:
+  - HOME_URL 改为根路径 /（截图确认授权后跳转到 optiklink.net 首页）
+  - do_login 增加服务条款确认按钮处理（参考 FreezeHost confirm_btn）
+  - read_dashboard 判断逻辑加强，加入 /home、My Plan、server 等多维判断
+  - 新增 ENABLE_SCREENSHOT 环境变量控制开关（workflow_dispatch 时可手动开启）
+  - browser.new_page 后显式设置 viewport
+  - 捕获并打印更完整的错误堆栈
 """
 
 import os
@@ -22,16 +30,20 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 # 配置（全部从 GitHub Secrets / 环境变量读取）
 # ─────────────────────────────────────────────────────────────
-DISCORD_TOKEN  = os.environ["DISCORD_TOKEN"]
-WXPUSHER_TOKEN = os.environ["WXPUSHER_TOKEN"]
-WXPUSHER_UID   = os.environ["WXPUSHER_UID"]
-EXPIRE_DATE    = os.environ.get("EXPIRE_DATE", "")
-PROXY_URL      = os.environ.get("PROXY_URL", "socks5://127.0.0.1:10808")
+DISCORD_TOKEN     = os.environ["DISCORD_TOKEN"]
+WXPUSHER_TOKEN    = os.environ["WXPUSHER_TOKEN"]
+WXPUSHER_UID      = os.environ["WXPUSHER_UID"]
+EXPIRE_DATE       = os.environ.get("EXPIRE_DATE", "")
+PROXY_URL         = os.environ.get("PROXY_URL", "socks5://127.0.0.1:10808")
 ENABLE_SCREENSHOT = os.environ.get("ENABLE_SCREENSHOT", "false").lower() == "true"
 
-BASE_URL   = "https://optiklink.net"
-AUTH_URL   = f"{BASE_URL}/auth"
-HOME_URL   = f"{BASE_URL}/home"
+BASE_URL = "https://optiklink.net"
+AUTH_URL = f"{BASE_URL}/auth"
+# FIX: 授权后实际跳转到根路径，不是 /home
+DASHBOARD_URL = BASE_URL
+
+VIEWPORT_W = 1280
+VIEWPORT_H = 753
 
 # ─────────────────────────────────────────────────────────────
 # 截图
@@ -45,7 +57,7 @@ def take_screenshot(page, name: str):
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = str(SCREENSHOT_DIR / f"{ts}_{name}.png")
-        page.screenshot(path=path, full_page=True)
+        page.screenshot(path=path, full_page=False)
         log.info(f"📸 截图已保存: {path}")
     except Exception as e:
         log.warning(f"截图失败: {e}")
@@ -123,15 +135,23 @@ def handle_oauth_page(page):
         # 滚动页面让授权按钮出现
         page.evaluate("""() => {
             const sels = ['[class*="scroller"]','[class*="oauth2"]','[class*="permissionList"]',
-                '[class*="content"] [class*="scroll"]','[class*="listScroller"]'];
+                '[class*="content"] [class*="scroll"]','[class*="listScroller"]',
+                'div[class*="modal"] div[style*="overflow"]','div[class*="root"] div[style*="overflow"]'];
+            let scrolled = false;
             for (const sel of sels) {
                 for (const el of document.querySelectorAll(sel)) {
                     const s = getComputedStyle(el);
                     if (el.scrollHeight > el.clientHeight &&
                         ['auto','scroll'].some(v => s.overflowY === v || s.overflow === v))
-                        { el.scrollTop = el.scrollHeight; }
+                        { el.scrollTop = el.scrollHeight; scrolled = true; }
                 }
             }
+            if (!scrolled) document.querySelectorAll('div').forEach(el => {
+                if (el.scrollHeight > el.clientHeight + 10) {
+                    const s = getComputedStyle(el);
+                    if (['auto','scroll','hidden'].includes(s.overflowY)) el.scrollTop = el.scrollHeight;
+                }
+            });
             scrollTo(0, document.body.scrollHeight);
         }""")
         page.wait_for_timeout(800)
@@ -154,6 +174,14 @@ def handle_oauth_page(page):
                 text = btn.inner_text().strip()
                 if any(k in text.lower() for k in ("取消", "cancel", "deny")):
                     continue
+                if "scroll" in text.lower():
+                    page.evaluate("""() => {
+                        document.querySelectorAll('div').forEach(el => {
+                            if (el.scrollHeight > el.clientHeight + 5) el.scrollTop = el.scrollHeight;
+                        }); scrollTo(0, document.body.scrollHeight);
+                    }""")
+                    page.wait_for_timeout(1000)
+                    break
                 if btn.is_disabled():
                     page.wait_for_timeout(1000)
                     break
@@ -173,41 +201,53 @@ def handle_oauth_page(page):
 def do_login(page) -> bool:
     """
     1. 打开 /auth 页面
-    2. 点击 Discord 登录按钮
+    2. 点击 Discord 登录按钮（可能先有服务条款确认按钮）
     3. 到达 discord.com 后注入 Token 并刷新
     4. 处理 OAuth 授权页
-    5. 等待跳回 optiklink.net/home
+    5. 等待跳回 optiklink.net
     """
     log.info(f"[A] 打开登录页: {AUTH_URL}")
     try:
         page.goto(AUTH_URL, timeout=30000, wait_until="domcontentloaded")
     except Exception as e:
-        log.warning(f"goto 超时: {e}")
+        log.warning(f"goto 超时/异常: {e}")
     take_screenshot(page, "01_auth_page")
+
+    # FIX: 服务条款确认按钮（参考 FreezeHost 的 confirm_btn 逻辑）
+    try:
+        confirm_btn = page.locator("button#confirm-login, button:has-text('同意'), button:has-text('Agree'), button:has-text('Accept')")
+        if confirm_btn.first.is_visible(timeout=3000):
+            confirm_btn.first.click()
+            log.info("已点击服务条款确认按钮")
+            page.wait_for_timeout(1500)
+    except Exception:
+        pass  # 没有确认按钮时正常跳过
 
     # 点击 Discord 登录按钮
     log.info("[B] 点击 Discord 登录按钮...")
-    try:
-        # OptikLink 的按钮文字是 "DISCORD" 或包含 discord
-        for sel in [
-            'a:has-text("DISCORD")',
-            'button:has-text("DISCORD")',
-            'a[href*="discord"]',
-            'a[href*="oauth2"]',
-            '.discord-btn',
-            'a:has-text("Sign in with Discord")',
-            'a:has-text("Login with Discord")',
-        ]:
-            try:
-                btn = page.locator(sel).first
-                if btn.is_visible(timeout=2000):
-                    btn.click()
-                    log.info(f"已点击: {sel}")
-                    break
-            except Exception:
-                continue
-    except Exception as e:
-        log.warning(f"点击登录按钮失败: {e}")
+    clicked = False
+    for sel in [
+        'a:has-text("DISCORD")',
+        'button:has-text("DISCORD")',
+        'button:has-text("Discord")',
+        'a[href*="discord.com/oauth2"]',
+        'a[href*="oauth2/authorize"]',
+        'a:has-text("Sign in with Discord")',
+        'a:has-text("Login with Discord")',
+        '.discord-btn',
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=2000):
+                btn.click()
+                log.info(f"已点击登录按钮: {sel}")
+                clicked = True
+                break
+        except Exception:
+            continue
+
+    if not clicked:
+        log.error("未找到 Discord 登录按钮")
         take_screenshot(page, "01b_click_fail")
         return False
 
@@ -243,8 +283,14 @@ def do_login(page) -> bool:
         page.wait_for_timeout(2000)
         if "discord.com" in page.url:
             handle_oauth_page(page)
+            # OAuth 完成后等待跳回
+            if "discord.com" in page.url:
+                try:
+                    page.wait_for_url(re.compile(r"optiklink\.net"), timeout=20000)
+                except Exception:
+                    pass
     except Exception:
-        # 可能已经自动跳过了授权页
+        # 可能已经自动跳过了授权页（之前授权过）
         if "discord.com" in page.url:
             handle_oauth_page(page)
 
@@ -257,16 +303,21 @@ def do_login(page) -> bool:
         log.info(f"已跳回: {page.url}")
     except Exception as e:
         log.warning(f"等待跳回超时: {e}，当前URL: {page.url}")
-        take_screenshot(page, "05_redirect_timeout")
-        return False
+        # 不立即返回失败，手动导航到首页再判断
+        if "optiklink.net" not in page.url:
+            take_screenshot(page, "05_redirect_timeout")
+            return False
 
-    # 确保到达 /home
-    if "/home" not in page.url:
-        log.info("跳转到 /home ...")
+    # FIX: 授权后跳转到根路径，若未在 /home 则手动导航首页（不强制要求 /home）
+    current = page.url
+    if "optiklink.net" in current and "/auth" not in current:
+        log.info(f"已在 OptikLink: {current}")
+    else:
+        log.info("手动导航到首页...")
         try:
-            page.goto(HOME_URL, timeout=20000, wait_until="domcontentloaded")
+            page.goto(DASHBOARD_URL, timeout=20000, wait_until="domcontentloaded")
         except Exception as e:
-            log.warning(f"goto /home 超时: {e}")
+            log.warning(f"goto 首页超时: {e}")
 
     take_screenshot(page, "05_home_page")
     return True
@@ -277,9 +328,9 @@ def do_login(page) -> bool:
 def read_dashboard(page) -> dict:
     log.info("[F] 读取 Dashboard 信息...")
     info = {
-        "logged_in":      False,
-        "username":       "N/A",
-        "expire_date":    EXPIRE_DATE,
+        "logged_in":       False,
+        "username":        "N/A",
+        "expire_date":     EXPIRE_DATE,
         "running_servers": "N/A",
     }
 
@@ -291,12 +342,21 @@ def read_dashboard(page) -> dict:
         log.warning(f"读取页面失败: {e}")
         return info
 
-    # 判断是否登录
-    if "dashboard" in page.url.lower() or "DASHBOARD" in html.upper() or "My Plan" in text:
+    current_url = page.url.lower()
+
+    # FIX: 加强登录态判断，避免误判 /auth 页面
+    is_logged_in = (
+        "/auth" not in current_url
+        and "optiklink.net" in current_url
+        and any(kw in html.upper() for kw in ("DASHBOARD", "MY PLAN", "SERVER", "LOGOUT", "SIGN OUT"))
+    )
+
+    if is_logged_in:
         info["logged_in"] = True
-        log.info("✅ 确认已登录")
+        log.info(f"✅ 确认已登录，URL: {page.url}")
     else:
-        log.warning(f"当前URL: {page.url}，未检测到 Dashboard")
+        log.warning(f"当前URL: {page.url}，未检测到登录态关键字")
+        log.warning(f"页面片段: {text[:200]}")
         return info
 
     # 用户名
@@ -311,7 +371,7 @@ def read_dashboard(page) -> dict:
             info["username"] = m.group(1) if m.lastindex else m.group(0)
             break
 
-    # 到期日期（优先从页面文字提取）
+    # 到期日期（从页面文字提取 DD.MM.YYYY 格式）
     for pat in [
         r'(\d{2}\.\d{2}\.\d{4})',
         r'date:\s*(\d{2}\.\d{2}\.\d{4})',
@@ -355,7 +415,7 @@ def build_message(info: dict) -> tuple[str, str]:
         warning = f"\n\n---\n## ⚠️ 服务即将到期\n\n> 距到期还剩 **{days_left}** 天，请尽快续期。"
         title = f"⚠️ OptikLink 签到 | 警告：{days_left}天后到期"
     else:
-        warning = f"\n\n> 📅 服务到期还剩 **{days_left}** 天" if days_left <= 30 else ""
+        warning = f"\n\n> 📅 服务到期还剩 **{days_left}** 天" if 0 < days_left <= 30 else ""
         title = f"OptikLink 签到 | {status}"
 
     content = f"""## OptikLink 每日自动登录报告
@@ -365,7 +425,7 @@ def build_message(info: dict) -> tuple[str, str]:
 | 状态 | {status} |
 | 用户名 | {info['username']} |
 | 运行服务器 | {info['running_servers']} 个 |
-| 服务到期 | {info['expire_date']} |
+| 服务到期 | {info['expire_date'] or '未知'} |
 | 剩余天数 | {days_left if days_left >= 0 else '未知'} 天 |
 | 执行时间 | {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC |
 {warning}
@@ -377,10 +437,11 @@ def build_message(info: dict) -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 55)
-    log.info("  OptikLink 自动登录脚本 v4 (CloakBrowser)")
+    log.info("  OptikLink 自动登录脚本 v4.1 (CloakBrowser)")
     log.info("=" * 55)
 
-    from cloakbrowser import launch
+    from cloakbrowser import launch, ensure_binary
+    ensure_binary()
 
     log.info("启动 CloakBrowser...")
     browser = launch(
@@ -389,7 +450,12 @@ def main():
         proxy=PROXY_URL,
         geoip=True,
     )
+    # FIX: 显式设置 viewport，避免指纹异常
     page = browser.new_page()
+    try:
+        page.set_viewport_size({"width": VIEWPORT_W, "height": VIEWPORT_H})
+    except Exception:
+        pass
 
     try:
         success = do_login(page)
@@ -397,7 +463,7 @@ def main():
         if not success:
             wxpush(
                 "OptikLink 签到 ❌ 失败",
-                f"## 执行失败\n\n**错误：** 登录流程未完成，请查看截图\n\n"
+                f"## 执行失败\n\n**错误：** 登录流程未完成，请查看日志\n\n"
                 f"时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
             )
             sys.exit(1)
@@ -407,13 +473,15 @@ def main():
         wxpush(title, content)
 
         if not info["logged_in"]:
-            log.error("Dashboard 未出现登录状态")
+            log.error("Dashboard 未出现登录状态，脚本标记为失败")
             sys.exit(1)
 
         log.info("✅ 全部完成！")
 
     except Exception as e:
-        log.exception(e)
+        import traceback
+        log.error(f"未预期异常: {e}")
+        traceback.print_exc()
         take_screenshot(page, "99_error")
         wxpush(
             "OptikLink 签到 ❌ 异常",
