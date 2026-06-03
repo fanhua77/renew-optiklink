@@ -1,15 +1,13 @@
 """
-OptikLink 每日自动登录脚本 v4.1 (CloakBrowser版)
+OptikLink 每日自动登录脚本 v4.2 (CloakBrowser版)
 原理：用 CloakBrowser 打开页面，注入 Discord Token 完成 OAuth2 授权
-参考：natfreecloud_renew_CloakBrowser / FreezeHost
 
-修复记录 v4.1:
-  - HOME_URL 改为根路径 /（截图确认授权后跳转到 optiklink.net 首页）
-  - do_login 增加服务条款确认按钮处理（参考 FreezeHost confirm_btn）
-  - read_dashboard 判断逻辑加强，加入 /home、My Plan、server 等多维判断
-  - 新增 ENABLE_SCREENSHOT 环境变量控制开关（workflow_dispatch 时可手动开启）
-  - browser.new_page 后显式设置 viewport
-  - 捕获并打印更完整的错误堆栈
+修复记录 v4.2:
+  - 修复 Discord 登录按钮选择器顺序（button 优先于 a 标签）
+  - 增加按钮等待超时时间（3000ms）
+  - 页面加载后增加 2s 等待让 JS 渲染完成
+  - 找不到按钮时自动打印页面所有可交互元素（调试用）
+  - 新增 button[class*="discord"] / [class*="discord"] 选择器兜底
 """
 
 import os
@@ -37,9 +35,8 @@ EXPIRE_DATE       = os.environ.get("EXPIRE_DATE", "")
 PROXY_URL         = os.environ.get("PROXY_URL", "socks5://127.0.0.1:10808")
 ENABLE_SCREENSHOT = os.environ.get("ENABLE_SCREENSHOT", "false").lower() == "true"
 
-BASE_URL = "https://optiklink.net"
-AUTH_URL = f"{BASE_URL}/auth"
-# FIX: 授权后实际跳转到根路径，不是 /home
+BASE_URL      = "https://optiklink.net"
+AUTH_URL      = f"{BASE_URL}/auth"
 DASHBOARD_URL = BASE_URL
 
 VIEWPORT_W = 1280
@@ -106,7 +103,7 @@ def inject_discord_token(page, token: str):
     log.info("Token 已注入 localStorage")
 
 # ─────────────────────────────────────────────────────────────
-# Discord OAuth 授权页处理（参考 FreezeHost）
+# Discord OAuth 授权页处理
 # 自动向下滚动直到授权按钮可见，然后点击
 # ─────────────────────────────────────────────────────────────
 def handle_oauth_page(page):
@@ -199,13 +196,6 @@ def handle_oauth_page(page):
 # 主登录流程
 # ─────────────────────────────────────────────────────────────
 def do_login(page) -> bool:
-    """
-    1. 打开 /auth 页面
-    2. 点击 Discord 登录按钮（可能先有服务条款确认按钮）
-    3. 到达 discord.com 后注入 Token 并刷新
-    4. 处理 OAuth 授权页
-    5. 等待跳回 optiklink.net
-    """
     log.info(f"[A] 打开登录页: {AUTH_URL}")
     try:
         page.goto(AUTH_URL, timeout=30000, wait_until="domcontentloaded")
@@ -213,7 +203,10 @@ def do_login(page) -> bool:
         log.warning(f"goto 超时/异常: {e}")
     take_screenshot(page, "01_auth_page")
 
-    # FIX: 服务条款确认按钮（参考 FreezeHost 的 confirm_btn 逻辑）
+    # FIX v4.2: 等待页面 JS 完全渲染
+    page.wait_for_timeout(2000)
+
+    # 服务条款确认按钮
     try:
         confirm_btn = page.locator("button#confirm-login, button:has-text('同意'), button:has-text('Agree'), button:has-text('Accept')")
         if confirm_btn.first.is_visible(timeout=3000):
@@ -221,15 +214,20 @@ def do_login(page) -> bool:
             log.info("已点击服务条款确认按钮")
             page.wait_for_timeout(1500)
     except Exception:
-        pass  # 没有确认按钮时正常跳过
+        pass
 
-    # 点击 Discord 登录按钮
+    # FIX v4.2: 调整选择器顺序，button 优先于 a 标签，增加 class 兜底选择器
     log.info("[B] 点击 Discord 登录按钮...")
     clicked = False
     for sel in [
-        'a:has-text("DISCORD")',
         'button:has-text("DISCORD")',
         'button:has-text("Discord")',
+        'button:has-text("discord")',
+        'a:has-text("DISCORD")',
+        'a:has-text("Discord")',
+        'button[class*="discord"]',
+        '[class*="discord-btn"]',
+        '[class*="discordBtn"]',
         'a[href*="discord.com/oauth2"]',
         'a[href*="oauth2/authorize"]',
         'a:has-text("Sign in with Discord")',
@@ -238,7 +236,7 @@ def do_login(page) -> bool:
     ]:
         try:
             btn = page.locator(sel).first
-            if btn.is_visible(timeout=2000):
+            if btn.is_visible(timeout=3000):   # FIX v4.2: 从 2000 改为 3000
                 btn.click()
                 log.info(f"已点击登录按钮: {sel}")
                 clicked = True
@@ -247,7 +245,21 @@ def do_login(page) -> bool:
             continue
 
     if not clicked:
-        log.error("未找到 Discord 登录按钮")
+        # FIX v4.2: 找不到按钮时打印页面所有可交互元素，方便调试
+        log.error("未找到 Discord 登录按钮，开始打印页面元素调试信息...")
+        try:
+            elements = page.locator("button, a").all()
+            for el in elements:
+                try:
+                    tag   = el.evaluate("el => el.tagName")
+                    text  = el.inner_text(timeout=500).strip()[:80]
+                    cls   = el.get_attribute("class") or ""
+                    href  = el.get_attribute("href") or ""
+                    log.info(f"  [{tag}] text='{text}' class='{cls[:60]}' href='{href[:60]}'")
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning(f"调试元素打印失败: {e}")
         take_screenshot(page, "01b_click_fail")
         return False
 
@@ -269,7 +281,6 @@ def do_login(page) -> bool:
     page.reload(wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(3000)
 
-    # 检查 Token 注入是否成功
     if re.search(r"discord\.com/login", page.url):
         log.error("Token 注入失败，仍在登录页")
         take_screenshot(page, "03_token_failed")
@@ -283,14 +294,12 @@ def do_login(page) -> bool:
         page.wait_for_timeout(2000)
         if "discord.com" in page.url:
             handle_oauth_page(page)
-            # OAuth 完成后等待跳回
             if "discord.com" in page.url:
                 try:
                     page.wait_for_url(re.compile(r"optiklink\.net"), timeout=20000)
                 except Exception:
                     pass
     except Exception:
-        # 可能已经自动跳过了授权页（之前授权过）
         if "discord.com" in page.url:
             handle_oauth_page(page)
 
@@ -303,12 +312,10 @@ def do_login(page) -> bool:
         log.info(f"已跳回: {page.url}")
     except Exception as e:
         log.warning(f"等待跳回超时: {e}，当前URL: {page.url}")
-        # 不立即返回失败，手动导航到首页再判断
         if "optiklink.net" not in page.url:
             take_screenshot(page, "05_redirect_timeout")
             return False
 
-    # FIX: 授权后跳转到根路径，若未在 /home 则手动导航首页（不强制要求 /home）
     current = page.url
     if "optiklink.net" in current and "/auth" not in current:
         log.info(f"已在 OptikLink: {current}")
@@ -344,7 +351,6 @@ def read_dashboard(page) -> dict:
 
     current_url = page.url.lower()
 
-    # FIX: 加强登录态判断，避免误判 /auth 页面
     is_logged_in = (
         "/auth" not in current_url
         and "optiklink.net" in current_url
@@ -359,11 +365,9 @@ def read_dashboard(page) -> dict:
         log.warning(f"页面片段: {text[:200]}")
         return info
 
-    # 用户名
     for pat in [
         r'Welcome\s+(?:<[^>]+>)?(\w+)(?:<[^>]+>)?\s+to',
         r'"username"\s*:\s*"([^"]+)"',
-        r'simeter\w+',
         r'Hello,?\s+(\w+)',
     ]:
         m = re.search(pat, html, re.I)
@@ -371,7 +375,6 @@ def read_dashboard(page) -> dict:
             info["username"] = m.group(1) if m.lastindex else m.group(0)
             break
 
-    # 到期日期（从页面文字提取 DD.MM.YYYY 格式）
     for pat in [
         r'(\d{2}\.\d{2}\.\d{4})',
         r'date:\s*(\d{2}\.\d{2}\.\d{4})',
@@ -382,7 +385,6 @@ def read_dashboard(page) -> dict:
             info["expire_date"] = m.group(1)
             break
 
-    # 运行服务器数
     m2 = re.search(r'(\d+)\s*(?:running\s*)?servers?', text, re.I)
     if m2:
         info["running_servers"] = m2.group(1)
@@ -437,7 +439,7 @@ def build_message(info: dict) -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 55)
-    log.info("  OptikLink 自动登录脚本 v4.1 (CloakBrowser)")
+    log.info("  OptikLink 自动登录脚本 v4.2 (CloakBrowser)")
     log.info("=" * 55)
 
     from cloakbrowser import launch, ensure_binary
@@ -450,7 +452,6 @@ def main():
         proxy=PROXY_URL,
         geoip=True,
     )
-    # FIX: 显式设置 viewport，避免指纹异常
     page = browser.new_page()
     try:
         page.set_viewport_size({"width": VIEWPORT_W, "height": VIEWPORT_H})
