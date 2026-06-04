@@ -787,8 +787,10 @@ def main():
     ensure_binary()
 
     log.info("启动 CloakBrowser...")
+    # headless=False：录屏依赖 ffmpeg x11grab 从 Xvfb :99 抓屏
+    # headless=True 时浏览器不渲染到显示器，录屏文件会是 0 字节黑屏
     browser = launch(
-        headless=True,
+        headless=False,
         humanize=True,
         proxy=PROXY_URL,
         geoip=True,
