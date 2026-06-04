@@ -5,16 +5,8 @@ on:
     - cron: "0 1 * * *"   # 每天 UTC 01:00（北京时间 09:00）
   workflow_dispatch:
     inputs:
-      enable_screenshot:
-        description: '是否截图 (true=截图 / false=不截图)'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
-      enable_screenrecord:
-        description: '是否录像 (true=录像 / false=不录像)'
+      enable_recording:
+        description: '是否开启录屏（true=录屏 / false=不录屏）'
         required: false
         default: 'false'
         type: choice
@@ -48,14 +40,12 @@ jobs:
             libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
             libxfixes3 libxrandr2 libgbm1 \
             libasound2t64 || sudo apt-get install -y -qq libasound2
-          # v4.6: 录屏依赖 — ffmpeg (x11grab 直接录制 Xvfb)
           sudo apt-get install -y -qq ffmpeg \
             || echo "ffmpeg 安装失败，录屏将不可用"
 
       - name: 安装 Python 依赖
         run: |
           pip install "cloakbrowser[geoip]"
-          # v4.6: Pillow 作为 GIF 合成的后备方案
           pip install Pillow
           python -c "from cloakbrowser import ensure_binary; ensure_binary()"
 
@@ -82,13 +72,13 @@ jobs:
           WXPUSHER_UID:        ${{ secrets.WXPUSHER_UID }}
           EXPIRE_DATE:         ${{ secrets.EXPIRE_DATE }}
           PROXY_URL:           "socks5://127.0.0.1:10808"
-          ENABLE_SCREENSHOT:   ${{ github.event.inputs.enable_screenshot || 'false' }}
-          ENABLE_SCREENRECORD: ${{ github.event.inputs.enable_screenrecord || 'false' }}
+          # 定时触发时 input 为空，默认不录屏
+          ENABLE_SCREENRECORD: ${{ github.event.inputs.enable_recording || 'false' }}
           DISPLAY:             ":99"
           LIBGL_ALWAYS_SOFTWARE: "1"
           GALLIUM_DRIVER:      "llvmpipe"
         run: |
-          # 与脚本在同一 step，后台进程可以共享（跨 step 后台进程会丢失）
+          # 启动 Xvfb
           Xvfb :99 -screen 0 1280x753x24 +extension RANDR &
           XVFB_PID=$!
           echo "等待 Xvfb :99 就绪..."
@@ -114,11 +104,13 @@ jobs:
           # 执行登录脚本
           timeout 300 python optiklink_cloakbrowser.py || echo "脚本退出码: $?"
 
+          echo "=== 截图目录 ==="
+          ls -la ./screenshots/ || echo "无截图"
+
           # 清理 Xvfb
           kill $XVFB_PID 2>/dev/null || true
 
-      # v4.6: 改为 always() 确保失败时也能上传
-      - name: 上传截图（仅截图模式或失败时）
+      - name: 上传截图
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -127,8 +119,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
-      - name: 上传录像（仅录像模式或失败时）
-        if: always()
+      - name: 上传录屏（仅录屏开启时）
+        if: always() && github.event.inputs.enable_recording == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: recordings
