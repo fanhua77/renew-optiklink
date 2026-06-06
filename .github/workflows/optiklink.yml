@@ -80,7 +80,7 @@ jobs:
           DISCORD_CLIENT_ID:    ${{ secrets.DISCORD_CLIENT_ID }}
           DISCORD_REDIRECT_URI: ${{ secrets.DISCORD_REDIRECT_URI }}
           EXPIRE_DATE:          ${{ secrets.EXPIRE_DATE }}
-          PROXY_URL:            ${{ secrets.PROXY_URL }}
+          PROXY_URL:            'socks5://127.0.0.1:10808'
           PANEL_API_KEY:        ${{ secrets.PANEL_API_KEY }}
           PANEL_SERVER_ID:      ${{ secrets.PANEL_SERVER_ID }}
           PANEL_URL:            "https://control.optiklink.net"
