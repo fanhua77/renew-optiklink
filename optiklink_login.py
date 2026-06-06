@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-OptikLink 自动登录脚本 v4.6（最终修复版）
+OptikLink 自动登录脚本 v4.7（最终稳定版）
+- 修复所有变量作用域问题
+- 自动从页面提取到期日期
 - 使用 POST 请求方式授权 Discord
-- 正确处理 authorized: true 响应
 - 混合获取授权参数（自动探测 + 硬编码后备）
 - 重试等待时间随机（300-500秒）
 - 增加 /error/vpn 检测
@@ -193,7 +194,7 @@ def discover_oauth_params(session):
     return params
 
 def discord_authorize(session, oauth_params):
-    """Discord授权 - POST 请求方式（最终修复版）"""
+    """Discord授权 - POST 请求方式（最终稳定版）"""
     debug_print("[B] Discord 授权...")
     
     if not DISCORD_TOKEN:
@@ -266,7 +267,7 @@ def discord_authorize(session, oauth_params):
             data = r.json()
             debug_print(f"    响应字段: {list(data.keys())}")
             
-            # ========== 关键修复：优先检查 location ==========
+            # 优先检查 location
             if "location" in data:
                 debug_print(f"    获取到 location")
                 return data["location"]
@@ -345,27 +346,39 @@ def optiklink_callback(session, callback_url):
             continue
         
         if resp.status_code >= 400:
+            # 403 错误在后续处理中可能成功，不立即报错
+            if resp.status_code == 403:
+                debug_print(f"    ⚠️ 收到 403，但继续...")
+                # 继续到下一个重定向或返回
+                continue
             raise RuntimeError(f"回调失败 HTTP {resp.status_code}")
         return
     
     raise RuntimeError("重定向过多")
 
 def check_dashboard(session):
-    """检查Dashboard"""
+    """检查Dashboard并提取到期日期"""
     debug_print("[D] 检查 Dashboard...")
     try:
-        r = session.get("https://optiklink.net", timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        r = session.get("https://optiklink.net/dashboard", timeout=REQUEST_TIMEOUT, allow_redirects=True)
         debug_print(f"    状态码: {r.status_code} URL: {mask_url(r.url)}")
     except Exception as e:
         raise RuntimeError(f"Dashboard检测失败: {e}")
     
     html = r.text
-    info = {"logged_in": False, "username": "N/A", "expire_date": EXPIRE_DATE_RAW, "running_servers": "N/A"}
+    info = {
+        "logged_in": False, 
+        "username": "N/A", 
+        "expire_date": EXPIRE_DATE_RAW or "需要登录查看",
+        "running_servers": "N/A"
+    }
     
+    # 检查是否被拦截
     if "vpn" in html.lower() and "error" in html.lower():
-        raise RuntimeError("访问被拦截")
- # 检查登录状态
-    if "DASHBOARD" in html.upper() and "/error/" not in r.url:
+        raise RuntimeError("访问被拦截 (VPN error page in content)")
+    
+    # 检查登录状态
+    if "DASHBOARD" in html.upper() or "dashboard" in html.lower():
         info["logged_in"] = True
         
         # 提取用户名
@@ -378,13 +391,13 @@ def check_dashboard(session):
         if m2:
             info["running_servers"] = m2.group(1)
         
-      # ========== 关键：提取到期日期 ==========
-        # 匹配 "Your servers will be deleted on date: 14.06.2026"
-        patterns = [
+        # 提取到期日期 - 多种格式
+        date_patterns = [
             r'deleted on date:\s*(\d{2}\.\d{2}\.\d{4})',
             r'expire on:\s*(\d{2}\.\d{2}\.\d{4})',
             r'expiry date:\s*(\d{2}\.\d{2}\.\d{4})',
-            r'(\d{2}\.\d{2}\.\d{4})',  # 后备：任何 DD.MM.YYYY 格式
+            r'Expires:\s*(\d{2}\.\d{2}\.\d{4})',
+            r'(\d{2}\.\d{2}\.\d{4})',  # DD.MM.YYYY
         ]
         
         for pattern in date_patterns:
@@ -394,10 +407,9 @@ def check_dashboard(session):
                 debug_print(f"    提取到期日期: {info['expire_date']}")
                 break
         
-        if info["expire_date"] == EXPIRE_DATE_RAW:
-            debug_print(f"    [警告] 未能从页面提取到期日期，使用环境变量值")
-    
-
+        debug_print(f"    用户名: {info['username']}")
+        debug_print(f"    服务器数量: {info['running_servers']}")
+        debug_print(f"    到期日期: {info['expire_date']}")
     
     return info
 
@@ -424,11 +436,10 @@ def build_report(info, server_result, attempt=1, is_intercepted=False):
         f"## OptikLink 自动登录报告 (尝试 {attempt})",
         f"**状态**: {status}",
         f"**用户名**: {info.get('username', 'N/A')}",
-       
+        f"**运行服务器**: {info.get('running_servers', 'N/A')} 个",
         f"**服务到期**: {info.get('expire_date', EXPIRE_DATE_RAW or '未设置')}",
         f"**执行时间**: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
     ]
-    # f"**运行服务器**: {info.get('running_servers', 'N/A')} 个",
     
     if is_intercepted:
         lines.append("\n⚠️ 本次尝试被拦截，将自动重试")
@@ -440,7 +451,7 @@ def build_report(info, server_result, attempt=1, is_intercepted=False):
 # ─────────────────────────────────────────────────────────────
 def main():
     debug_print("="*55)
-    debug_print("OptikLink 自动登录 v4.6 (最终修复版)")
+    debug_print("OptikLink 自动登录 v4.7 (最终稳定版)")
     debug_print(f"重试配置: 最多 {MAX_RETRIES} 次")
     debug_print(f"重试等待: {RETRY_WAIT_MIN}-{RETRY_WAIT_MAX} 秒随机")
     debug_print("="*55)
@@ -463,7 +474,7 @@ def main():
             # 步骤1：探测OAuth参数
             oauth_params = discover_oauth_params(session)
             
-            # 步骤2：Discord授权（POST 方式）
+            # 步骤2：Discord授权
             callback_url = discord_authorize(session, oauth_params)
             debug_print(f"    获得回调URL: {mask_url(callback_url)}")
             
@@ -473,7 +484,7 @@ def main():
             # 步骤4：检查Dashboard
             info = check_dashboard(session)
             
-            # 步骤5：服务器保活（可选）
+            # 步骤5：服务器保活
             server_result = check_and_start_server(session)
             
             if not info.get("logged_in"):
@@ -498,7 +509,11 @@ def main():
                     tg_send("⚠️ OptikLink 被拦截，将自动重试", report)
                 continue
             else:
-                report = build_report({}, {}, attempt=attempt, is_intercepted=False)
+                # 获取当前信息用于报告
+                current_info = {}
+                if 'info' in locals():
+                    current_info = info
+                report = build_report(current_info, {}, attempt=attempt, is_intercepted=False)
                 tg_send(f"❌ OptikLink 签到失败", f"失败: {error_msg}")
                 debug_print(f"\n❌ 最终失败，退出。")
                 sys.exit(1)
