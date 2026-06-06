@@ -1,25 +1,17 @@
-name: OptikLink 每日自动登录
+name: OptikLink 每日自动登录+服务器保活
 
 on:
   schedule:
-    - cron: "0 1 * * *"   # 每天 UTC 01:00（北京时间 09:00）
+    - cron: "23 2 * * *"   # UTC 02:23 北京时间 10:23
   workflow_dispatch:
-    inputs:
-      enable_recording:
-        description: '是否开启录屏（true=录屏 / false=不录屏）'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
+
+permissions:
+  contents: write
 
 jobs:
   auto-login:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
+    timeout-minutes: 20        # 增加到20分钟，适应重试逻辑
 
     steps:
       - name: 检出代码
@@ -30,106 +22,101 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 安装系统依赖
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            xvfb x11-utils curl unzip \
-            fonts-noto-cjk \
-            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
-            libxfixes3 libxrandr2 libgbm1 \
-            libasound2t64 || sudo apt-get install -y -qq libasound2
-          sudo apt-get install -y -qq ffmpeg \
-            || echo "ffmpeg 安装失败，录屏将不可用"
+      - name: 安装依赖
+        run: pip install requests cloudscraper "requests[socks]"
 
-      - name: 安装 Python 依赖
-        run: |
-          pip install "cloakbrowser[geoip]"
-          pip install Pillow
-          python -c "from cloakbrowser import ensure_binary; ensure_binary()"
-
-      - name: 下载并启动 Xray 代理
+      # ----- Xray 代理（精简输出版）-----
+      - name: 下载并启动 Xray 代理（精简版）
         env:
           V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
         run: |
-          curl -sL https://github.com/XTLS/Xray-core/releases/download/v25.5.16/Xray-linux-64.zip -o xray.zip
-          unzip xray.zip && chmod +x xray
-          echo "$V2RAY_CONFIG" > config.json
-          ./xray run -c config.json &
-          sleep 5
-          echo "=== 直连 IP ==="
-          curl -s --max-time 5 ifconfig.me || echo "获取失败"
-          echo ""
-          echo "=== 代理 IP（SOCKS5 10808）==="
-          curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me || echo "获取失败"
-          echo ""
+          set -euo pipefail
+          trap 'rm -f xray.zip xray config.json xray.log' EXIT
 
-      - name: 启动 Xvfb 并执行自动登录脚本
-        env:
-          DISCORD_TOKEN:       ${{ secrets.DISCORD_TOKEN }}
-          TELEGRAM_BOT_TOKEN:      ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:        ${{ secrets.TELEGRAM_CHAT_ID }}
-          EXPIRE_DATE:         ${{ secrets.EXPIRE_DATE }}
-          PROXY_URL:           "socks5://127.0.0.1:10808"
-          # 定时触发时 input 为空，默认不录屏
-          ENABLE_SCREENRECORD: ${{ (github.event_name == 'schedule' && 'false') || (github.event.inputs.enable_recording == 'true' && 'true') || 'false' }}
-          DISPLAY:             ":99"
-          LIBGL_ALWAYS_SOFTWARE: "1"
-          GALLIUM_DRIVER:      "llvmpipe"
-        run: |
-          # 启动 Xvfb
-          Xvfb :99 -screen 0 1280x754x24 +extension RANDR &  # 高度须为偶数，与 VIEWPORT_H 保持一致
-          XVFB_PID=$!
-          echo "等待 Xvfb :99 就绪..."
-          if command -v xdpyinfo > /dev/null 2>&1; then
-            for i in $(seq 1 15); do
-              if DISPLAY=:99 xdpyinfo > /dev/null 2>&1; then
-                echo "✅ Xvfb 就绪（第 ${i} 次检测）"
-                break
-              fi
-              if [ "$i" -eq 15 ]; then
-                echo "❌ Xvfb 15 次检测仍未就绪，终止"
-                exit 1
-              fi
-              echo "  第 ${i} 次检测未就绪，等待 1s..."
-              sleep 1
-            done
+          # 安装工具（完全静默）
+          sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq jq netcat-openbsd >/dev/null 2>&1
+
+          # 下载 Xray
+          curl -sL --fail -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q xray.zip xray && chmod +x xray
+
+          # 写入配置并校验
+          echo "$V2RAY_CONFIG" | jq . > config.json 2>/dev/null || { echo "❌ 配置无效"; exit 1; }
+          echo "✅ 配置有效"
+
+          # 启动 Xray
+          ./xray run -c config.json > xray.log 2>&1 &
+          XRAY_PID=$!
+          echo "XRAY_PID=$XRAY_PID" >> $GITHUB_ENV
+
+          # 等待端口就绪（静默，仅最终输出）
+          for i in {1..30}; do
+            nc -z 127.0.0.1 10808 2>/dev/null && break
+            sleep 1
+          done
+          if ! nc -z 127.0.0.1 10808 2>/dev/null; then
+            echo "❌ 端口未就绪，Xray 日志："
+            tail -20 xray.log
+            exit 1
+          fi
+          echo "✅ 代理端口已就绪"
+
+          # 测试代理出口 IP
+          PROXY_IP=$(curl -s --max-time 10 --socks5 127.0.0.1:10808 ifconfig.me 2>/dev/null || echo "")
+          if [ -n "$PROXY_IP" ]; then
+            echo "代理 IP: $PROXY_IP"
           else
-            echo "xdpyinfo 不可用，直接等待 3s..."
-            sleep 3
-            echo "✅ Xvfb 等待完成"
+            echo "❌ 代理测试失败"
+            exit 1
           fi
 
-          # 执行登录脚本
-          timeout 300 python optiklink_cloakbrowser.py || echo "脚本退出码: $?"
+      # ----- 执行登录和保活脚本 -----
+      - name: 执行自动登录+服务器保活脚本
+        id: login
+        env:
+          DISCORD_TOKEN:        ${{ secrets.DISCORD_TOKEN }}
+          BOT_TOKEN:            ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:              ${{ secrets.CHAT_ID }}
+          DISCORD_CLIENT_ID:    ${{ secrets.DISCORD_CLIENT_ID }}
+          DISCORD_REDIRECT_URI: ${{ secrets.DISCORD_REDIRECT_URI }}
+          EXPIRE_DATE:          ${{ secrets.EXPIRE_DATE }}
+          PROXY_URL:            ${{ secrets.PROXY_URL }}
+          PANEL_API_KEY:        ${{ secrets.PANEL_API_KEY }}
+          PANEL_SERVER_ID:      ${{ secrets.PANEL_SERVER_ID }}
+          PANEL_URL:            "https://control.optiklink.net"
+          SERVER_START_WAIT:    "60"
+        run: |
+          python optiklink_login.py
 
-          echo "=== 截图目录 ==="
-          ls -la ./screenshots/ || echo "无截图"
+      # ----- 自动更新 DISCORD_CLIENT_ID -----
+      - name: 自动更新 DISCORD_CLIENT_ID Secret
+        if: steps.login.outputs.new_client_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_CID:  ${{ steps.login.outputs.new_client_id }}
+        run: |
+          echo "检测到新 client_id，正在自动更新 Secret..."
+          gh secret set DISCORD_CLIENT_ID --body "$NEW_CID" --repo "$GITHUB_REPOSITORY"
+          echo "✅ Secret DISCORD_CLIENT_ID 已自动更新"
 
-          # 清理 Xvfb
-          kill $XVFB_PID 2>/dev/null || true
-
-      - name: 上传截图
+      # ----- 提交 time.txt 保持仓库活跃 -----
+      - name: 提交 time.txt 保持仓库活跃
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots
-          path: ./screenshots/*.png
-          if-no-files-found: ignore
-          retention-days: 3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt
+          if git diff --cached --quiet; then
+            echo "无变化，无需提交"
+          else
+            git commit -m "⏱️ 更新时间文件: $(date +'%Y-%m-%d %H:%M:%S')"
+            git push origin HEAD:main
+          fi
 
-      - name: 上传录屏（仅录屏开启时）
-        if: always() && github.event.inputs.enable_recording == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: recordings
-          path: |
-            ./recordings/*.gif
-            ./recordings/*.mp4
-          if-no-files-found: ignore
-          retention-days: 3
-
+  # ----- 清理旧的 workflow runs -----
   cleanup-old-runs:
     runs-on: ubuntu-latest
     needs: auto-login
@@ -142,22 +129,32 @@ jobs:
         with:
           script: |
             const KEEP = 2;
-            const workflowName = "OptikLink 每日自动登录";
+            const workflowName = "OptikLink 每日自动登录+服务器保活";
             const workflows = await github.rest.actions.listRepoWorkflows({
               owner: context.repo.owner,
               repo:  context.repo.repo,
             });
             const wf = workflows.data.workflows.find(w => w.name === workflowName);
-            if (!wf) { console.log("未找到 workflow，跳过清理"); return; }
+            if (!wf) {
+              console.log("未找到 workflow，跳过清理");
+              return;
+            }
             const runs = await github.paginate(
               github.rest.actions.listWorkflowRuns,
-              { owner: context.repo.owner, repo: context.repo.repo, workflow_id: wf.id, per_page: 100 }
+              {
+                owner:       context.repo.owner,
+                repo:        context.repo.repo,
+                workflow_id: wf.id,
+                per_page:    100,
+              }
             );
             const toDelete = runs.slice(KEEP);
             console.log(`共 ${runs.length} 条 run，保留 ${KEEP} 条，删除 ${toDelete.length} 条`);
             for (const run of toDelete) {
               await github.rest.actions.deleteWorkflowRun({
-                owner: context.repo.owner, repo: context.repo.repo, run_id: run.id,
+                owner:  context.repo.owner,
+                repo:   context.repo.repo,
+                run_id: run.id,
               });
               console.log(`已删除 run #${run.run_number} (id=${run.id})`);
             }
