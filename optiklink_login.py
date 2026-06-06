@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-OptikLink 自动登录脚本 v4.5（混合授权 + 随机重试）
-- 混合获取授权参数：自动探测 + 硬编码后备
+OptikLink 自动登录脚本 v4.6（最终修复版）
+- 使用 POST 请求方式授权 Discord
+- 正确处理 authorized: true 响应
+- 混合获取授权参数（自动探测 + 硬编码后备）
 - 重试等待时间随机（300-500秒）
 - 增加 /error/vpn 检测
-- 增强超时和错误处理
 """
 
 import os
@@ -12,6 +13,7 @@ import re
 import sys
 import time
 import random
+import json
 import signal
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, urlencode
@@ -161,7 +163,7 @@ def discover_oauth_params(session):
         debug_print(f"    状态码: {r.status_code}")
     except Exception as e:
         debug_print(f"    ❌ 请求失败: {e}")
-        return params  # 返回空参数，后续使用后备值
+        return params
     
     # 从页面提取 Discord 授权链接
     patterns = [
@@ -183,7 +185,6 @@ def discover_oauth_params(session):
             if qs.get("state"):
                 params["state"] = qs["state"][0]
             debug_print(f"    [探测] client_id: {mask(params['client_id'])}")
-            debug_print(f"    [探测] redirect_uri: {params['redirect_uri'][:50] if params['redirect_uri'] else 'N/A'}...")
             break
     
     if not params["client_id"]:
@@ -192,23 +193,20 @@ def discover_oauth_params(session):
     return params
 
 def discord_authorize(session, oauth_params):
-    """Discord授权 - 混合获取参数（探测 + 后备）"""
+    """Discord授权 - POST 请求方式（修复版）"""
     debug_print("[B] Discord 授权...")
     
-    # 检查 Discord Token
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN 未设置")
     
-    # 混合获取参数：优先使用探测值，无效则使用硬编码后备值
+    # 混合获取参数
     client_id = oauth_params.get("client_id") or FALLBACK_CLIENT_ID
     redirect_uri = oauth_params.get("redirect_uri") or FALLBACK_REDIRECT_URI
     scope = oauth_params.get("scope") or FALLBACK_SCOPE
     
-    # 验证参数有效性
     if not client_id or not redirect_uri:
         raise RuntimeError(f"缺少必要参数: client_id={client_id}, redirect_uri={redirect_uri}")
     
-    # 打印参数来源
     if oauth_params.get("client_id"):
         debug_print(f"    [来源: 自动探测]")
     else:
@@ -218,14 +216,12 @@ def discord_authorize(session, oauth_params):
     debug_print(f"    redirect_uri: {redirect_uri}")
     debug_print(f"    scope: {scope}")
     
-    # 构造授权URL
-    auth_url = "https://discord.com/api/v10/oauth2/authorize"
+    # 构造请求参数
     params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
         "scope": scope,
-        "prompt": "none"
     }
     
     if "state" in oauth_params and oauth_params["state"]:
@@ -233,14 +229,23 @@ def discord_authorize(session, oauth_params):
     
     headers = {
         "Authorization": DISCORD_TOKEN,
+        "Content-Type": "application/json",
         "User-Agent": HEADERS_BROWSER["User-Agent"],
+        "Referer": "https://discord.com/oauth2/authorize?" + urlencode(params),
     }
     
+    # 使用 POST 请求 + JSON body
     try:
-        debug_print(f"    请求 Discord API...")
+        debug_print(f"    请求 Discord API (POST 方式)...")
         start_time = time.time()
-        r = session.get(auth_url, params=params, headers=headers, 
-                       allow_redirects=False, timeout=REQUEST_TIMEOUT)
+        r = session.post(
+            "https://discord.com/api/v10/oauth2/authorize",
+            params=params,
+            json={"authorize": True, "permissions": "0"},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=False
+        )
         elapsed = time.time() - start_time
         debug_print(f"    Discord 状态: {r.status_code} 耗时: {elapsed:.2f}秒")
         
@@ -252,35 +257,46 @@ def discord_authorize(session, oauth_params):
     if r.status_code == 302 or r.status_code == 301:
         location = r.headers.get("Location")
         if location:
-            debug_print(f"    授权成功，重定向到: {mask_url(location)}")
+            debug_print(f"    重定向到: {mask_url(location)}")
             return location
-        raise RuntimeError("重定向响应缺少 Location 头")
+        raise RuntimeError("重定向无 Location")
     
     elif r.status_code == 200:
         try:
             data = r.json()
             debug_print(f"    响应字段: {list(data.keys())}")
             
-            if data.get("authorized") == True and "location" in data:
+            # 检查 authorized 字段
+            if data.get("authorized") == True:
                 debug_print(f"    账号已授权该应用")
-                return data["location"]
+                # 方式1：响应中有 location
+                if "location" in data:
+                    debug_print(f"    获取到 location")
+                    return data["location"]
+                # 方式2：响应中有 code，构造回调 URL
+                elif "code" in data:
+                    callback_url = f"{redirect_uri}?code={data['code']}"
+                    debug_print(f"    从 code 构造回调URL")
+                    return callback_url
+                else:
+                    # 调试：打印完整响应
+                    debug_print(f"    ⚠️ 响应中没有 location 或 code")
+                    debug_print(f"    完整响应: {json.dumps(data, indent=2)[:500]}")
+                    raise RuntimeError("无法从响应中获取授权码")
             
             elif data.get("authorized") == False:
                 debug_print(f"    ❌ Discord 账号未授权此应用")
                 manual_url = f"https://discord.com/oauth2/authorize?client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&scope={scope}"
-                debug_print(f"    请手动访问以下链接进行授权:")
-                debug_print(f"    {manual_url}")
+                debug_print(f"    请手动授权: {manual_url}")
                 raise RuntimeError("需要在 Discord 中手动授权应用（至少一次）")
             
-            elif "location" in data:
-                return data["location"]
-            elif "url" in data:
-                return data["url"]
             else:
-                raise RuntimeError("无法从响应中获取重定向地址")
+                debug_print(f"    ❌ 未知响应格式")
+                debug_print(f"    完整响应: {json.dumps(data, indent=2)[:500]}")
+                raise RuntimeError("无法解析 Discord 响应")
                 
         except Exception as e:
-            debug_print(f"    ❌ 解析响应失败: {e}")
+            debug_print(f"    ❌ 解析失败: {e}")
             raise RuntimeError(f"Discord 响应无效")
     
     elif r.status_code == 400:
@@ -366,7 +382,6 @@ def check_and_start_server(session):
     result["skipped"] = False
     debug_print("[保活] 检查服务器状态...")
     # 这里可以添加实际的服务器保活逻辑
-    # 如果不需要，直接返回
     return result
 
 # ─────────────────────────────────────────────────────────────
@@ -395,7 +410,7 @@ def build_report(info, server_result, attempt=1, is_intercepted=False):
 # ─────────────────────────────────────────────────────────────
 def main():
     debug_print("="*55)
-    debug_print("OptikLink 自动登录 v4.5 (混合授权 + 随机重试)")
+    debug_print("OptikLink 自动登录 v4.6 (最终修复版)")
     debug_print(f"重试配置: 最多 {MAX_RETRIES} 次")
     debug_print(f"重试等待: {RETRY_WAIT_MIN}-{RETRY_WAIT_MAX} 秒随机")
     debug_print("="*55)
@@ -418,8 +433,9 @@ def main():
             # 步骤1：探测OAuth参数
             oauth_params = discover_oauth_params(session)
             
-            # 步骤2：Discord授权（自动使用探测值或后备值）
+            # 步骤2：Discord授权（POST 方式）
             callback_url = discord_authorize(session, oauth_params)
+            debug_print(f"    获得回调URL: {mask_url(callback_url)}")
             
             # 步骤3：处理回调
             optiklink_callback(session, callback_url)
