@@ -47,8 +47,8 @@ log = logging.getLogger(__name__)
 # 配置（全部从 GitHub Secrets / 环境变量读取）
 # ─────────────────────────────────────────────────────────────
 DISCORD_TOKEN        = os.environ["DISCORD_TOKEN"]
-WXPUSHER_TOKEN       = os.environ["WXPUSHER_TOKEN"]
-WXPUSHER_UID         = os.environ["WXPUSHER_UID"]
+TELEGRAM_BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]   # Telegram Bot Token
+TELEGRAM_CHAT_ID     = os.environ["TELEGRAM_CHAT_ID"]     # Telegram Chat ID
 EXPIRE_DATE          = os.environ.get("EXPIRE_DATE", "")
 PROXY_URL            = os.environ.get("PROXY_URL", "socks5://127.0.0.1:10808")
 ENABLE_SCREENRECORD  = os.environ.get("ENABLE_SCREENRECORD",  "false").lower() == "true"
@@ -172,34 +172,82 @@ def stop_page_recording(rec):
         log.info(f"🎬 录屏文件: {path} ({size_mb:.1f} MB)")
     else:
         log.warning(f"🎬 录屏文件未生成: {path}")
-
 # ─────────────────────────────────────────────────────────────
-# WxPusher 推送
+# Telegram Bot 推送（替换 WxPusher）
 # ─────────────────────────────────────────────────────────────
-def wxpush(title: str, content: str):
+def telegram_send_message(text: str, parse_mode: str = "Markdown"):
+    """
+    通过 Telegram Bot 发送消息
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram Bot Token 或 Chat ID 未配置，跳过推送")
+        return False
+    
     import urllib.request
+    import urllib.parse
+    
+    # Telegram Bot API URL
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    
+    # 构建请求数据
     payload = json.dumps({
-        "appToken":    WXPUSHER_TOKEN,
-        "content":     content,
-        "summary":     title,
-        "contentType": 3,
-        "uids":        [WXPUSHER_UID],
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,  # 禁用链接预览，使消息更简洁
     }).encode()
+    
     try:
         req = urllib.request.Request(
-            "https://wxpusher.zjiecode.com/api/send/message",
+            api_url,
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        # 设置超时时间
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read())
-            if result.get("success"):
-                log.info("📨 WxPusher 推送成功")
+            if result.get("ok"):
+                log.info("📨 Telegram 推送成功")
+                return True
             else:
-                log.warning(f"📨 WxPusher 推送失败: {result}")
+                error_desc = result.get("description", "未知错误")
+                log.warning(f"📨 Telegram 推送失败: {error_desc}")
+                # 如果 Markdown 解析失败，尝试纯文本发送
+                if "can't parse entities" in error_desc and parse_mode == "Markdown":
+                    log.info("尝试使用纯文本模式重新发送...")
+                    return telegram_send_message(text, parse_mode="")
+                return False
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()
+        log.warning(f"📨 Telegram HTTP 错误 {e.code}: {error_body}")
+        return False
     except Exception as e:
-        log.warning(f"📨 WxPusher 推送异常: {e}")
+        log.warning(f"📨 Telegram 推送异常: {e}")
+        return False
+
+
+def telegram_send_with_retry(title: str, content: str):
+    """
+    构建完整的 Telegram 消息并发送
+    """
+    # 组合完整消息
+    full_message = f"*{title}*\n\n{content}"
+    
+    # 限制消息长度（Telegram 限制 4096 字符）
+    if len(full_message) > 4096:
+        full_message = full_message[:4093] + "..."
+    
+    # 发送消息
+    return telegram_send_message(full_message, parse_mode="Markdown")
+
+
+# 保留 wxpush 函数名以兼容现有代码，但内部改用 Telegram
+def wxpush(title: str, content: str):
+    """
+    兼容旧函数名，实际调用 Telegram 推送
+    """
+    telegram_send_with_retry(title, content)
 
 # ─────────────────────────────────────────────────────────────
 # Discord Token 注入工具
