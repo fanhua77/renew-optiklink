@@ -86,6 +86,7 @@ jobs:
           PANEL_URL:            "https://control.optiklink.net"
           SERVER_START_WAIT:    "60"
         run: |
+          python test_discord.py
           python optiklink_login.py
 
       # ----- 自动更新 DISCORD_CLIENT_ID -----
