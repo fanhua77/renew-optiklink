@@ -222,42 +222,93 @@ def discover_oauth_params(session):
         tg_send("⚠️ client_id 已变更", f"旧: {mask(DISCORD_CLIENT_ID,6)}\n新: {mask(new_cid,6)}")
     
     return params
+debug_print(f"    使用的 client_id: {auth_params['client_id']}")
+debug_print(f"    使用的 redirect_uri: {auth_params['redirect_uri']}")
+debug_print(f"    使用的 scope: {auth_params['scope']}")
 
 def discord_authorize(session, oauth_params):
-    """Discord授权"""
+    """Discord授权 - 使用GET请求 + 自动重定向（修复400错误）"""
     debug_print("[B] Discord 授权...")
-    post_params = {k: oauth_params[k] for k in ("client_id", "redirect_uri", "response_type", "scope") if k in oauth_params}
+    
+    # 构造授权参数
+    auth_params = {
+        "client_id": oauth_params.get("client_id", DISCORD_CLIENT_ID),
+        "redirect_uri": oauth_params.get("redirect_uri", DISCORD_REDIRECT_URI),
+        "response_type": "code",
+        "scope": oauth_params.get("scope", "identify"),
+    }
+    
+    # 添加 state（如果有）
     if "state" in oauth_params:
-        post_params["state"] = oauth_params["state"]
+        auth_params["state"] = oauth_params["state"]
+    
+    # 构造完整授权URL
+    auth_url = "https://discord.com/api/v10/oauth2/authorize?" + urlencode(auth_params)
+    debug_print(f"    授权URL: {mask_url(auth_url)}")
     
     headers = {
         "Authorization": DISCORD_TOKEN,
-        "Content-Type": "application/json",
         "User-Agent": HEADERS_BROWSER["User-Agent"],
-        "Referer": "https://discord.com/oauth2/authorize?" + urlencode(post_params),
-        "X-Super-Properties": "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIn0=",
     }
     
     try:
-        debug_print(f"    正在请求 Discord API (超时: {REQUEST_TIMEOUT}秒)")
+        debug_print(f"    正在请求 Discord 授权 (超时: {REQUEST_TIMEOUT}秒)")
         start_time = time.time()
-        r = session.post("https://discord.com/api/v10/oauth2/authorize",
-                         params=post_params,
-                         json={"authorize": True, "permissions": "0"},
-                         headers=headers, 
-                         timeout=REQUEST_TIMEOUT, 
-                         allow_redirects=False)
+        
+        # 使用 GET 请求，不允许自动重定向（我们手动处理）
+        r = session.get(auth_url, headers=headers, allow_redirects=False, timeout=REQUEST_TIMEOUT)
         elapsed = time.time() - start_time
         debug_print(f"    Discord 状态: {r.status_code} 耗时: {elapsed:.2f}秒")
+        
     except Exception as e:
         debug_print(f"    ❌ Discord 请求失败: {type(e).__name__}: {e}")
         raise RuntimeError(f"Discord授权失败: {e}")
     
-    if r.status_code == 200 and "location" in r.json():
-        return r.json()["location"]
-    if r.status_code in (301,302,303,307,308) and "Location" in r.headers:
-        return r.headers["Location"]
-    raise RuntimeError(f"Discord 授权失败 HTTP {r.status_code}")
+    # 处理重定向（成功时会重定向到 callback URL）
+    if r.status_code == 302 or r.status_code == 301:
+        location = r.headers.get("Location")
+        if location:
+            debug_print(f"    获取到重定向地址")
+            return location
+        else:
+            raise RuntimeError("重定向响应缺少 Location 头")
+    
+    # 处理 JSON 响应（某些情况下）
+    elif r.status_code == 200:
+        try:
+            data = r.json()
+            if "location" in data:
+                return data["location"]
+            elif "url" in data:
+                return data["url"]
+            else:
+                debug_print(f"    响应字段: {list(data.keys())}")
+                # 如果响应中有 code，可以直接构造回调URL
+                if "code" in data:
+                    callback_url = f"{auth_params['redirect_uri']}?code={data['code']}"
+                    debug_print(f"    从响应中提取 code，构造回调URL")
+                    return callback_url
+                raise RuntimeError("未找到重定向地址")
+        except Exception as e:
+            debug_print(f"    ❌ 解析响应失败: {e}")
+            debug_print(f"    响应内容: {r.text[:200]}")
+            raise RuntimeError("无法解析 Discord 响应")
+    
+    # 处理 400 错误 - 参数问题
+    elif r.status_code == 400:
+        debug_print(f"    ❌ 请求参数错误 (HTTP 400)")
+        debug_print(f"    响应内容: {r.text[:300]}")
+        raise RuntimeError("Discord 授权参数错误，请检查 client_id 和 redirect_uri 是否正确")
+    
+    # 处理 401 未授权
+    elif r.status_code == 401:
+        debug_print(f"    ❌ Token 无效 (HTTP 401)")
+        raise RuntimeError("Discord Token 无效或已过期")
+    
+    else:
+        debug_print(f"    ❌ 未知错误: HTTP {r.status_code}")
+        debug_print(f"    响应内容: {r.text[:200]}")
+        raise RuntimeError(f"Discord 授权失败 HTTP {r.status_code}")
 
 def optiklink_callback(session, callback_url):
     """处理回调 - 增加 /error/vpn 检测"""
