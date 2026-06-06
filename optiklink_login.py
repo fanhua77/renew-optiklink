@@ -193,7 +193,7 @@ def discover_oauth_params(session):
     return params
 
 def discord_authorize(session, oauth_params):
-    """Discord授权 - POST 请求方式（修复版）"""
+    """Discord授权 - POST 请求方式（最终修复版）"""
     debug_print("[B] Discord 授权...")
     
     if not DISCORD_TOKEN:
@@ -205,7 +205,7 @@ def discord_authorize(session, oauth_params):
     scope = oauth_params.get("scope") or FALLBACK_SCOPE
     
     if not client_id or not redirect_uri:
-        raise RuntimeError(f"缺少必要参数: client_id={client_id}, redirect_uri={redirect_uri}")
+        raise RuntimeError(f"缺少必要参数")
     
     if oauth_params.get("client_id"):
         debug_print(f"    [来源: 自动探测]")
@@ -266,29 +266,33 @@ def discord_authorize(session, oauth_params):
             data = r.json()
             debug_print(f"    响应字段: {list(data.keys())}")
             
+            # ========== 关键修复：优先检查 location ==========
+            if "location" in data:
+                debug_print(f"    获取到 location")
+                return data["location"]
+            
             # 检查 authorized 字段
-            if data.get("authorized") == True:
+            elif data.get("authorized") == True:
                 debug_print(f"    账号已授权该应用")
-                # 方式1：响应中有 location
-                if "location" in data:
-                    debug_print(f"    获取到 location")
-                    return data["location"]
-                # 方式2：响应中有 code，构造回调 URL
-                elif "code" in data:
+                if "code" in data:
                     callback_url = f"{redirect_uri}?code={data['code']}"
                     debug_print(f"    从 code 构造回调URL")
                     return callback_url
+                elif "location" in data:
+                    return data["location"]
                 else:
-                    # 调试：打印完整响应
-                    debug_print(f"    ⚠️ 响应中没有 location 或 code")
-                    debug_print(f"    完整响应: {json.dumps(data, indent=2)[:500]}")
-                    raise RuntimeError("无法从响应中获取授权码")
+                    raise RuntimeError("已授权但未找到重定向地址")
             
             elif data.get("authorized") == False:
                 debug_print(f"    ❌ Discord 账号未授权此应用")
                 manual_url = f"https://discord.com/oauth2/authorize?client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&scope={scope}"
                 debug_print(f"    请手动授权: {manual_url}")
                 raise RuntimeError("需要在 Discord 中手动授权应用（至少一次）")
+            
+            elif "code" in data:
+                callback_url = f"{redirect_uri}?code={data['code']}"
+                debug_print(f"    从 code 构造回调URL")
+                return callback_url
             
             else:
                 debug_print(f"    ❌ 未知响应格式")
