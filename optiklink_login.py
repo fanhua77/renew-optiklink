@@ -14,13 +14,14 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, urlencode
 
+import requests as _req  # 始终可用，cloudscraper 依赖它
+
 # 优先使用 cloudscraper 绕过 Cloudflare
 try:
     import cloudscraper
     USE_CLOUDSCRAPER = True
     print("[信息] 使用 cloudscraper 绕过 Cloudflare 人机验证")
 except ImportError:
-    import requests
     USE_CLOUDSCRAPER = False
     print("[警告] cloudscraper 未安装，将使用普通 requests，可能无法绕过 Cloudflare")
 
@@ -71,7 +72,7 @@ def create_session():
     if USE_CLOUDSCRAPER:
         sess = cloudscraper.create_scraper()
     else:
-        sess = requests.Session()
+        sess = _req.Session()
     if PROXY_URL:
         sess.proxies = {"http": PROXY_URL, "https": PROXY_URL}
         print(f"[信息] 使用代理: {PROXY_URL}")
@@ -80,26 +81,32 @@ def create_session():
     sess.headers.update(HEADERS_BROWSER)
     return sess
 
+_tg_session = None
+
 def tg_send(title: str, content: str):
-    """发送 Telegram 消息（Markdown）"""
-    import requests as req
+    """发送 Telegram 消息（Markdown），带自动重试（3次）"""
+    global _tg_session
+    if _tg_session is None:
+        _tg_session = _req.Session()
+        _tg_session.headers.update({"Content-Type": "application/json"})
+
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     text = f"*{title}*\n\n{content}"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-    }
-    try:
-        resp = req.post(url, json=payload, timeout=15)
-        result = resp.json()
-        if result.get("ok"):
-            print(f"[Telegram] 推送成功 | chat_id={mask(TG_CHAT_ID)}")
-        else:
-            print(f"[Telegram] 推送失败: {result.get('description')}")
-    except Exception as e:
-        print(f"[Telegram] 请求异常: {e}")
+    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
+
+    for attempt in range(3):
+        try:
+            resp = _tg_session.post(url, json=payload, timeout=15)
+            result = resp.json()
+            if result.get("ok"):
+                print(f"[Telegram] 推送成功 | chat_id={mask(TG_CHAT_ID)}")
+                return
+            print(f"[Telegram] 推送失败: {result.get('description', 'unknown')}")
+        except Exception as e:
+            print(f"[Telegram] 请求异常 (第{attempt+1}次): {e}")
+        if attempt < 2:
+            time.sleep(2)
+    print("[Telegram] 推送最终失败（重试耗尽）")
 
 # ─────────────────────────────────────────────────────────────
 # 登录核心流程
@@ -138,7 +145,6 @@ def discover_oauth_params(session):
         if github_output:
             with open(github_output, "a") as f:
                 f.write(f"new_client_id={new_cid}\n")
-        tg_send("⚠️ client_id 已变更", f"旧: {mask(DISCORD_CLIENT_ID,6)}\n新: {mask(new_cid,6)}")
     return params
 
 def discord_authorize(session, oauth_params):
@@ -399,9 +405,6 @@ def main():
             
             if intercepted and attempt < MAX_RETRIES:
                 print(f"检测到拦截，将在 {RETRY_WAIT_SEC} 秒后重试...")
-                if attempt == 1:
-                    report = build_report(info, server_result, attempt=attempt, is_intercepted=True)
-                    tg_send("⚠️ OptikLink 被拦截，将自动重试", report)
                 continue
             else:
                 final_report = build_report(info, server_result, attempt=attempt, is_intercepted=intercepted)
