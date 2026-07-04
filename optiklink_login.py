@@ -40,10 +40,6 @@ PANEL_SERVER_ID     = os.environ.get("PANEL_SERVER_ID", "")
 SERVER_START_WAIT   = int(os.environ.get("SERVER_START_WAIT", "60"))
 PROXY_URL           = os.environ.get("PROXY_URL", "")
 
-# 重试配置
-MAX_RETRIES = 3
-RETRY_WAIT_SEC = 300
-
 # 硬编码后备参数（从成功的登录链接中提取）
 FALLBACK_CLIENT_ID = "933437142254887052"
 FALLBACK_REDIRECT_URI = "https://optiklink.com/login"
@@ -329,7 +325,7 @@ def check_and_start_server(session):
 # ─────────────────────────────────────────────────────────────
 # 构建简洁报告
 # ─────────────────────────────────────────────────────────────
-def build_report(info, server_result, attempt=1, is_intercepted=False):
+def build_report(info, server_result):
     now = datetime.now(timezone.utc)
     status = "✅ 登录成功" if info["logged_in"] else "❌ 登录失败"
     days_left = "N/A"
@@ -340,7 +336,7 @@ def build_report(info, server_result, attempt=1, is_intercepted=False):
         pass
 
     lines = [
-        f"## OptikLink 自动登录报告 (尝试 {attempt})",
+        f"## OptikLink 自动登录报告",
         f"**状态**: {status}",
         f"**用户名**: {info['username']}",
         f"**运行服务器**: {info['running_servers']} 个",
@@ -357,8 +353,6 @@ def build_report(info, server_result, attempt=1, is_intercepted=False):
             lines.append(f"**启动后状态**: {server_result['status_after']}")
             if server_result['action_taken'] == 'start':
                 lines.append("**操作**: ▶️ 已自动启动")
-    if is_intercepted:
-        lines.append("\n⚠️ 本次尝试被拦截（VPN error），将自动重试")
     return "\n".join(lines)
 
 # ─────────────────────────────────────────────────────────────
@@ -366,60 +360,34 @@ def build_report(info, server_result, attempt=1, is_intercepted=False):
 # ─────────────────────────────────────────────────────────────
 def main():
     print("="*55)
-    print("OptikLink 自动登录 v4.3-fixed (必要修复版)")
-    print(f"重试配置: 最多 {MAX_RETRIES} 次, 间隔 {RETRY_WAIT_SEC} 秒")
+    print("OptikLink 自动登录 v5.0 (单次执行版)")
     print("="*55)
 
-    last_info = None
-    last_server_result = None
-    final_intercepted = False
+    print("\n========== 开始执行 ==========")
+    session = create_session()
+    info = {"logged_in": False, "username": "N/A", "expire_date": EXPIRE_DATE_RAW, "running_servers": "N/A"}
+    server_result = {"skipped": True}
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        if attempt > 1:
-            print(f"\n⏳ 第 {attempt} 次尝试，等待 {RETRY_WAIT_SEC} 秒...")
-            time.sleep(RETRY_WAIT_SEC)
+    try:
+        oauth_params = discover_oauth_params(session)
+        callback_url = discord_authorize(session, oauth_params)
+        optiklink_callback(session, callback_url)
+        info = check_dashboard(session)
+        server_result = check_and_start_server(session)
 
-        print(f"\n========== 尝试 {attempt}/{MAX_RETRIES} ==========")
-        session = create_session()
-        intercepted = False
-        info = {"logged_in": False, "username": "N/A", "expire_date": EXPIRE_DATE_RAW, "running_servers": "N/A"}
-        server_result = {"skipped": True}
+        if not info["logged_in"]:
+            raise RuntimeError("Dashboard 未识别为登录状态")
+    except Exception as e:
+        error_msg = str(e)
+        print(f"❌ 执行失败: {error_msg}")
+        report = build_report(info, server_result)
+        tg_send("❌ OptikLink 签到失败", report)
+        print("\n❌ 最终失败，退出。")
+        sys.exit(1)
 
-        try:
-            oauth_params = discover_oauth_params(session)
-            callback_url = discord_authorize(session, oauth_params)
-            optiklink_callback(session, callback_url)
-            info = check_dashboard(session)
-            server_result = check_and_start_server(session)
-
-            if not info["logged_in"]:
-                raise RuntimeError("Dashboard 未识别为登录状态")
-        except Exception as e:
-            error_msg = str(e)
-            print(f"⚠️ 尝试 {attempt} 失败: {error_msg}")
-            last_info = info
-            last_server_result = server_result
-            
-            if "VPN error" in error_msg or "vpn" in error_msg.lower():
-                intercepted = True
-            
-            if intercepted and attempt < MAX_RETRIES:
-                print(f"检测到拦截，将在 {RETRY_WAIT_SEC} 秒后重试...")
-                continue
-            else:
-                final_report = build_report(info, server_result, attempt=attempt, is_intercepted=intercepted)
-                tg_send(f"❌ OptikLink 签到失败 (尝试 {attempt})", final_report)
-                print(f"\n❌ 最终失败，退出。")
-                sys.exit(1)
-
-        print(f"✅ 尝试 {attempt} 成功！")
-        report = build_report(info, server_result, attempt=attempt)
-        tg_send("✅ OptikLink 签到成功", report)
-        return
-
-    final_report = build_report(last_info or {}, last_server_result or {}, attempt=MAX_RETRIES, is_intercepted=final_intercepted)
-    tg_send("❌ OptikLink 签到失败 (重试耗尽)", final_report)
-    sys.exit(1)
+    print("✅ 执行成功！")
+    report = build_report(info, server_result)
+    tg_send("✅ OptikLink 签到成功", report)
 
 if __name__ == "__main__":
     main()
