@@ -2,20 +2,16 @@ name: OptikLink 每日自动登录+服务器保活
 
 on:
   schedule:
-    # 使用 cron 表达式，但实际运行时间会随机偏移
-    # 基础时间：每天 UTC 00:00（北京时间 08:00）
     - cron: '0 1 */3 * *'
   workflow_dispatch:
-    
 
 permissions:
   contents: write
 
 jobs:
- 
   auto-login:
     runs-on: ubuntu-latest
-    timeout-minutes: 20        # 增加到20分钟，适应重试逻辑
+    timeout-minutes: 20
 
     steps:
       - name: 检出代码
@@ -29,52 +25,70 @@ jobs:
       - name: 安装依赖
         run: pip install requests cloudscraper "requests[socks]"
 
-      # ----- Xray 代理（精简输出版）-----
-      - name: 下载并启动 Xray 代理（精简版）
+      - name: 下载并启动 Xray 代理
         env:
-          V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
+          VLESS_NODE: ${{ secrets.VLESS_NODE }}
         run: |
           set -euo pipefail
           trap 'rm -f xray.zip xray config.json xray.log' EXIT
 
-          # 安装工具（完全静默）
+          # 安装工具
           sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq jq netcat-openbsd >/dev/null 2>&1
 
           # 下载 Xray
           curl -sL --fail -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -q xray.zip xray && chmod +x xray
 
-          # 写入配置并校验
-          echo "$V2RAY_CONFIG" | jq . > config.json 2>/dev/null || { echo "❌ 配置无效"; exit 1; }
-          echo "✅ 配置有效"
+          # 检查 VLESS_NODE
+          if [ -z "$VLESS_NODE" ]; then
+            echo "❌ 错误: 未设置 VLESS_NODE 环境变量"
+            exit 1
+          fi
+          echo "🔄 正在解析 VLESS 链接..."
+
+          # 生成配置（引用外部脚本）
+          python3 generate_xray_config.py > config.json
+
+          # 验证配置
+          if ! jq . config.json >/dev/null 2>&1; then
+            echo "❌ 生成的配置无效"
+            cat config.json
+            exit 1
+          fi
+          
+          NODE_ADDR=$(jq -r '.outbounds[0].settings.vnext[0].address' config.json)
+          NODE_PORT=$(jq -r '.outbounds[0].settings.vnext[0].port' config.json)
+          echo "✅ 配置生成成功: ${NODE_ADDR}:${NODE_PORT}"
 
           # 启动 Xray
           ./xray run -c config.json > xray.log 2>&1 &
           XRAY_PID=$!
           echo "XRAY_PID=$XRAY_PID" >> $GITHUB_ENV
 
-          # 等待端口就绪（静默，仅最终输出）
+          # 等待端口就绪
           for i in {1..30}; do
-            nc -z 127.0.0.1 10808 2>/dev/null && break
+            if nc -z 127.0.0.1 10808 2>/dev/null; then
+              echo "✅ 代理端口已就绪 (耗时 ${i} 秒)"
+              break
+            fi
             sleep 1
           done
+          
           if ! nc -z 127.0.0.1 10808 2>/dev/null; then
             echo "❌ 端口未就绪，Xray 日志："
             tail -20 xray.log
             exit 1
           fi
-          echo "✅ 代理端口已就绪"
 
-          # 测试代理出口 IP
+          # 测试代理
+          echo "🔄 测试代理连接..."
           PROXY_IP=$(curl -s --max-time 10 --socks5 127.0.0.1:10808 ifconfig.me 2>/dev/null || echo "")
           if [ -n "$PROXY_IP" ]; then
-            echo "代理 IP: $PROXY_IP"
+            echo "✅ 代理工作正常，出口 IP: $PROXY_IP"
           else
-            echo "❌ 代理测试失败"
-            exit 1
+            echo "⚠️ 代理测试失败（可能目标网站不可达，继续执行）"
           fi
 
-      # ----- 执行登录和保活脚本 -----
       - name: 执行自动登录+服务器保活脚本
         id: login
         env:
@@ -90,10 +104,8 @@ jobs:
           PANEL_URL:            "https://control.optiklink.net"
           SERVER_START_WAIT:    "60"
         run: |
-       
           python -u optiklink_login.py
 
-      # ----- 自动更新 DISCORD_CLIENT_ID -----
       - name: 自动更新 DISCORD_CLIENT_ID Secret
         if: steps.login.outputs.new_client_id != ''
         env:
@@ -104,7 +116,6 @@ jobs:
           gh secret set DISCORD_CLIENT_ID --body "$NEW_CID" --repo "$GITHUB_REPOSITORY"
           echo "✅ Secret DISCORD_CLIENT_ID 已自动更新"
 
-      # ----- 提交 time.txt 保持仓库活跃 -----
       - name: 提交 time.txt 保持仓库活跃
         if: always()
         env:
@@ -121,7 +132,6 @@ jobs:
             git push origin HEAD:main
           fi
 
-  # ----- 清理旧的 workflow runs -----
   cleanup-old-runs:
     runs-on: ubuntu-latest
     needs: auto-login
